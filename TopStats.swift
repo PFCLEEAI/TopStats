@@ -211,9 +211,13 @@ final class SystemStats: ObservableObject {
     @Published var isFreeingMemory = false
     @Published var lastFreeUpResult: String?
 
+    /// Invoked on the main queue after every sample tick; the menu-bar title
+    /// refresh piggybacks on this instead of running its own 5 s timer.
+    var onSample: (() -> Void)?
+
     private let workQueue = DispatchQueue(label: "TopStats.Sampler", qos: .utility)
     private let cleanerQueue = DispatchQueue(label: "TopStats.MemoryCleaner", qos: .userInitiated)
-    private var timer: Timer?
+    private var timer: DispatchSourceTimer?
     private var prevCPUInfo: [Int32]?
     private var prevNetworkIn: UInt64 = 0
     private var prevNetworkOut: UInt64 = 0
@@ -224,6 +228,9 @@ final class SystemStats: ObservableObject {
     private var latestProcessesByPID: [Int: ProcessSnapshot] = [:]
     /// Dashboard visibility; read and written only on `workQueue`.
     private var menuIsOpen = false
+    /// Cached IOAccelerator service handle; touched only on `workQueue`.
+    /// 0 = not yet matched (or dropped after a stale read).
+    private var gpuAcceleratorService: io_object_t = 0
 
     private static let appBundleRegex = try? NSRegularExpression(pattern: #"/([^/]+)\.app/"#)
     private static let gpuClientPIDRegex = try? NSRegularExpression(pattern: #"pid [0-9]+"#)
@@ -235,23 +242,30 @@ final class SystemStats: ObservableObject {
         prevNetworkTime = Date()
 
         refreshAll()
-        timer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
-            self?.refresh()
+        // DispatchSourceTimer fires straight on the sampling queue: no main
+        // run-loop timer wakeup and no main->work queue hop per tick.
+        let source = DispatchSource.makeTimerSource(queue: workQueue)
+        source.schedule(
+            deadline: .now() + Self.refreshInterval,
+            repeating: Self.refreshInterval,
+            leeway: .seconds(1) // let the system coalesce wakeups
+        )
+        source.setEventHandler { [weak self] in
+            self?.sampleOnQueue(forceHeavy: false)
         }
-        // Let the system coalesce timer wakeups (Apple guidance: >=10% tolerance).
-        timer?.tolerance = 1.0
+        source.resume()
+        timer = source
     }
 
     deinit {
-        timer?.invalidate()
+        timer?.cancel()
+        if gpuAcceleratorService != 0 {
+            IOObjectRelease(gpuAcceleratorService)
+        }
     }
 
     func refreshAll() {
         sample(forceHeavy: true)
-    }
-
-    func refresh() {
-        sample(forceHeavy: false)
     }
 
     /// Dashboard menu is opening: resume dashboard-only sampling and refresh everything now.
@@ -267,52 +281,65 @@ final class SystemStats: ObservableObject {
 
     private func sample(forceHeavy: Bool) {
         workQueue.async {
-            let cpu = self.readCPU()
-            let ram = self.readRAM()
-            let temp = self.readTemperature()
-            let net = self.readNetwork()
+            self.sampleOnQueue(forceHeavy: forceHeavy)
+        }
+    }
 
-            let now = Date()
-            var gpu: Double?
-            if forceHeavy || now.timeIntervalSince(self.lastGPUSample) >= Self.refreshInterval {
-                gpu = self.readGPU()
-                self.lastGPUSample = now
+    /// Must run on `workQueue` (the timer fires here directly).
+    /// Explicit autorelease pool: GCD worker threads drain lazily, and the
+    /// per-tick Foundation/CF churn (file read, IORegistry dictionary)
+    /// otherwise lingers between 5 s ticks.
+    private func sampleOnQueue(forceHeavy: Bool) {
+        autoreleasepool { sampleBody(forceHeavy: forceHeavy) }
+    }
+
+    private func sampleBody(forceHeavy: Bool) {
+        let cpu = readCPU()
+        let ram = readRAM()
+        let temp = readTemperature()
+        let net = readNetwork()
+
+        let now = Date()
+        var gpu: Double?
+        if forceHeavy || now.timeIntervalSince(lastGPUSample) >= Self.refreshInterval {
+            gpu = readGPU()
+            lastGPUSample = now
+        }
+
+        // The process list (ps) and GPU-client scan (ioreg) only feed the
+        // dashboard, so at idle (menu closed) they are skipped entirely;
+        // the menu-bar title needs none of them.
+        if forceHeavy || menuIsOpen {
+            if forceHeavy || now.timeIntervalSince(lastProcessSample) >= 10 {
+                updateProcessConsumers()
+                lastProcessSample = now
             }
 
-            // The process list (ps) and GPU-client scan (ioreg) only feed the
-            // dashboard, so at idle (menu closed) they are skipped entirely;
-            // the menu-bar title needs none of them.
-            if forceHeavy || self.menuIsOpen {
-                if forceHeavy || now.timeIntervalSince(self.lastProcessSample) >= 10 {
-                    self.updateProcessConsumers()
-                    self.lastProcessSample = now
-                }
-
-                if forceHeavy || now.timeIntervalSince(self.lastGPUClientSample) >= 30 {
-                    self.updateGPUClients()
-                    self.lastGPUClientSample = now
-                }
+            if forceHeavy || now.timeIntervalSince(lastGPUClientSample) >= 30 {
+                updateGPUClients()
+                lastGPUClientSample = now
             }
+        }
 
-            // One main-thread hop per tick; assign only values that actually
-            // changed so observers are not invalidated by identical data.
-            DispatchQueue.main.async {
-                var changed = false
-                if let cpu, cpu != self.cpuUsage { self.cpuUsage = cpu; changed = true }
-                if let ram {
-                    if ram.used != self.ramUsed { self.ramUsed = ram.used; changed = true }
-                    if ram.free != self.ramFree { self.ramFree = ram.free; changed = true }
-                    if ram.total != self.ramTotal { self.ramTotal = ram.total; changed = true }
-                }
-                if temp.text != self.temperature { self.temperature = temp.text; changed = true }
-                if temp.value != self.temperatureValue { self.temperatureValue = temp.value; changed = true }
-                if let net {
-                    if net.down != self.downloadSpeed { self.downloadSpeed = net.down; changed = true }
-                    if net.up != self.uploadSpeed { self.uploadSpeed = net.up; changed = true }
-                }
-                if let gpu, gpu != self.gpuUsage { self.gpuUsage = gpu; changed = true }
-                if changed { self.lastUpdated = Date() }
+        // One main-thread hop per tick; assign only values that actually
+        // changed so observers are not invalidated by identical data.
+        DispatchQueue.main.async {
+            var changed = false
+            if let cpu, cpu != self.cpuUsage { self.cpuUsage = cpu; changed = true }
+            if let ram {
+                if ram.used != self.ramUsed { self.ramUsed = ram.used; changed = true }
+                if ram.free != self.ramFree { self.ramFree = ram.free; changed = true }
+                if ram.total != self.ramTotal { self.ramTotal = ram.total; changed = true }
             }
+            if temp.text != self.temperature { self.temperature = temp.text; changed = true }
+            if temp.value != self.temperatureValue { self.temperatureValue = temp.value; changed = true }
+            if let net {
+                if net.down != self.downloadSpeed { self.downloadSpeed = net.down; changed = true }
+                if net.up != self.uploadSpeed { self.uploadSpeed = net.up; changed = true }
+            }
+            if let gpu, gpu != self.gpuUsage { self.gpuUsage = gpu; changed = true }
+            if changed { self.lastUpdated = Date() }
+            self.onSample?()
         }
     }
 
@@ -482,21 +509,47 @@ final class SystemStats: ObservableObject {
         }
     }
 
+    /// Reads GPU utilization straight from the IORegistry (same
+    /// "Device Utilization %" the old `ioreg` subprocess reported) so the
+    /// idle loop spawns zero processes. The matched service handle is cached;
+    /// re-reading one property is microseconds versus a fork/exec every tick.
     private func readGPU() -> Double? {
-        guard let output = runCommand("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "IOAccelerator", "-w", "0"]) else {
+        if gpuAcceleratorService == 0 {
+            var iterator: io_iterator_t = 0
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else {
+                return nil
+            }
+            defer { IOObjectRelease(iterator) }
+
+            var service = IOIteratorNext(iterator)
+            while service != 0 {
+                if let usage = Self.deviceUtilization(of: service) {
+                    gpuAcceleratorService = service // keep the handle
+                    return usage
+                }
+                IOObjectRelease(service)
+                service = IOIteratorNext(iterator)
+            }
             return nil
         }
 
-        return output
-            .split(separator: "\n")
-            .lazy
-            .compactMap { line -> Double? in
-                guard let marker = line.range(of: "\"Device Utilization %\"=") else { return nil }
-                let tail = line[marker.upperBound...]
-                let digits = tail.prefix { $0.isNumber || $0 == "." }
-                return Double(digits)
-            }
-            .first
+        if let usage = Self.deviceUtilization(of: gpuAcceleratorService) {
+            return usage
+        }
+
+        // Stale handle (GPU reset / sleep-wake): drop it and rematch next tick.
+        IOObjectRelease(gpuAcceleratorService)
+        gpuAcceleratorService = 0
+        return nil
+    }
+
+    private static func deviceUtilization(of service: io_object_t) -> Double? {
+        guard let raw = IORegistryEntryCreateCFProperty(service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue(),
+              let stats = raw as? [String: Any],
+              let value = stats["Device Utilization %"] as? NSNumber else {
+            return nil
+        }
+        return value.doubleValue
     }
 
     private func readTemperature() -> (text: String, value: Double) {
@@ -1366,7 +1419,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let stats = SystemStats()
     private let settings = AppSettings()
     private var statusItem: NSStatusItem!
-    private var statusRefreshTimer: Timer?
     private var tempHelperProcess: Process?
     private var dashboardHost: NSHostingView<TopStatsDashboardView>?
     private var dashboardItem: NSMenuItem?
@@ -1384,10 +1436,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateMenuBarTitle()
         observeCommands()
 
-        statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: SystemStats.refreshInterval, repeats: true) { [weak self] _ in
+        // The title refreshes when a sample tick publishes (same 5 s cadence);
+        // no dedicated main-run-loop timer needed.
+        stats.onSample = { [weak self] in
             self?.updateMenuBarTitle()
         }
-        statusRefreshTimer?.tolerance = 1.0
     }
 
     private func observeCommands() {
@@ -1458,7 +1511,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        statusRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         tempHelperProcess?.terminate()
     }
