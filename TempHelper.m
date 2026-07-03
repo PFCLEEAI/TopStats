@@ -1,6 +1,6 @@
 // TempHelper.m - Apple Silicon Temperature Reader
 // Uses IOHIDEventSystemClient to read actual CPU temperature sensors
-// Compile: clang -Wall -framework IOKit -framework Foundation -o TempHelper TempHelper.m
+// Compile: clang -O2 -Wall -framework IOKit -framework Foundation -o TempHelper TempHelper.m
 // NOTE: compiled without ARC (build.sh passes no -fobjc-arc) — manual retain/release below.
 
 #import <Foundation/Foundation.h>
@@ -210,10 +210,12 @@ int main(int argc, const char *argv[]) {
                 NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
 
                 // Skip the write when the rounded value is unchanged, but still
-                // rewrite at least once a minute so the file's mtime stays fresh.
+                // rewrite periodically so the file's mtime stays fresh. 50 s
+                // threshold + 10 s ticks bounds the worst-case mtime age at
+                // ~60 s (the old 60 s + 5 s ticks allowed ~65 s).
                 if (lastWritten == nil
                     || ![tempStr isEqualToString:lastWritten]
-                    || now - lastWriteTime >= 60) {
+                    || now - lastWriteTime >= 50) {
                     NSError *error = nil;
                     if ([tempStr writeToFile:tempFile atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
                         [lastWritten release];
@@ -226,8 +228,10 @@ int main(int argc, const char *argv[]) {
             }
         }
 
-        // Match the app's lightweight refresh cadence.
-        [NSThread sleepForTimeInterval:5.0];
+        // CPU package temperature moves slowly and the title shows whole
+        // degrees; a 10 s cadence halves the helper's steady-state CPU while
+        // staying well inside the freshness bound above.
+        [NSThread sleepForTimeInterval:10.0];
     }
     return 0;
 }

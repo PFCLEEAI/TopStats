@@ -5,12 +5,13 @@ set -e
 
 echo "Building TopStats..."
 
-# Compile main app
-swiftc -o TopStats TopStats.swift -framework Cocoa -framework SwiftUI -framework IOKit -framework Network
+# Compile main app (release optimization: -Onone debug codegen is 5-20x slower
+# on the per-tick sampling/formatting paths that run every 5 s for the app's lifetime)
+swiftc -O -o TopStats TopStats.swift -framework Cocoa -framework SwiftUI -framework IOKit -framework Network
 
 # Compile temp helper (Objective-C version for accurate Apple Silicon temperature reading)
 # Uses IOHIDEventSystemClient to read actual CPU die temperature from HID sensors
-clang -Wall -framework IOKit -framework Foundation -o TempHelper TempHelper.m
+clang -O2 -Wall -framework IOKit -framework Foundation -o TempHelper TempHelper.m
 
 # Create app bundle
 rm -rf TopStats.app

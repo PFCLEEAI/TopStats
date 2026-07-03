@@ -231,9 +231,16 @@ final class SystemStats: ObservableObject {
     /// Cached IOAccelerator service handle; touched only on `workQueue`.
     /// 0 = not yet matched (or dropped after a stale read).
     private var gpuAcceleratorService: io_object_t = 0
+    /// Last idle malloc purge; `Date.distantPast` makes the first idle tick
+    /// purge immediately (that one reclaims the launch-time churn). On `workQueue`.
+    private var lastMallocRelief = Date.distantPast
 
     private static let appBundleRegex = try? NSRegularExpression(pattern: #"/([^/]+)\.app/"#)
     private static let gpuClientPIDRegex = try? NSRegularExpression(pattern: #"pid [0-9]+"#)
+
+    /// `mach_host_self()` returns a send right whose uref count grows on every
+    /// call (and can overflow after days of 5 s ticks); fetch it once and reuse.
+    private static let machHost: mach_port_t = mach_host_self()
 
     init() {
         let (inBytes, outBytes) = getNetworkBytes()
@@ -341,6 +348,18 @@ final class SystemStats: ObservableObject {
             if changed { self.lastUpdated = Date() }
             self.onSample?()
         }
+
+        // At idle, hand freed malloc pages back to the OS so the resident
+        // footprint tracks what the app actually uses — the launch-time heavy
+        // sample (ps parse) and menu churn otherwise linger in malloc bins.
+        // Once a minute, not every tick: the relief walks every malloc zone
+        // (the nano zone scan is not free) and purged pages re-fault on the
+        // next allocation, so per-tick calls trade CPU for no extra RSS win.
+        // Skipped while the dashboard is open so interactive use never pays it.
+        if !forceHeavy && !menuIsOpen && now.timeIntervalSince(lastMallocRelief) >= 60 {
+            malloc_zone_pressure_relief(nil, 0)
+            lastMallocRelief = now
+        }
     }
 
     private func readCPU() -> Double? {
@@ -348,7 +367,7 @@ final class SystemStats: ObservableObject {
         var numCPUInfo: mach_msg_type_number_t = 0
         var numCPUs: natural_t = 0
 
-        let err = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &numCPUInfo)
+        let err = host_processor_info(Self.machHost, PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &numCPUInfo)
         guard err == KERN_SUCCESS, let info = cpuInfo else { return nil }
 
         var totalUser: Int32 = 0
@@ -392,7 +411,7 @@ final class SystemStats: ObservableObject {
 
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                host_statistics64(Self.machHost, HOST_VM_INFO64, $0, &count)
             }
         }
 
@@ -422,7 +441,7 @@ final class SystemStats: ObservableObject {
 
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                host_statistics64(Self.machHost, HOST_VM_INFO64, $0, &count)
             }
         }
 
