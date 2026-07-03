@@ -1,0 +1,30 @@
+# Compiled binaries
+TopStats
+TempHelper
+FloatingMonitor
+
+# App bundles (for local builds)
+*.app/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+
+# Temporary files
+*.tmp
+*.log
+
+# Project memory / local tooling (not part of the public codebase)
+_pm/
+.claude/
+
+# Backup files
+*.backup*

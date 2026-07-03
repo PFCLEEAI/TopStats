@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#22103a"/>
+      <stop offset="100%" stop-color="#0a142a"/>
+    </linearGradient>
+    <linearGradient id="bar1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#6860ff"/>
+      <stop offset="100%" stop-color="#3f75ff"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#568bff"/>
+      <stop offset="100%" stop-color="#40c7ff"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2be0e2"/>
+      <stop offset="100%" stop-color="#5dffd1"/>
+    </linearGradient>
+  </defs>
+  <rect x="54" y="54" width="916" height="916" rx="196" fill="url(#bg)"/>
+  <rect x="86" y="86" width="852" height="852" rx="164" fill="none" stroke="#ffffff" stroke-opacity="0.11" stroke-width="4"/>
+  <rect x="318" y="438" width="104" height="238" rx="34" fill="url(#bar1)" stroke="#ffffff" stroke-opacity="0.13" stroke-width="3"/>
+  <rect x="452" y="350" width="104" height="326" rx="34" fill="url(#bar2)" stroke="#ffffff" stroke-opacity="0.13" stroke-width="3"/>
+  <rect x="586" y="256" width="104" height="420" rx="34" fill="url(#bar3)" stroke="#ffffff" stroke-opacity="0.13" stroke-width="3"/>
+  <circle cx="724" cy="290" r="28" fill="#52ffd4" stroke="#ffffff" stroke-opacity="0.14" stroke-width="3"/>
+</svg>
