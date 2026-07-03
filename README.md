@@ -2,7 +2,7 @@
 
 A lightweight menu-bar system monitor for macOS. Displays CPU, RAM, GPU, and temperature directly in the macOS status area, with a dashboard of gauge cards and top app consumers one click away.
 
-![TopStats Screenshot](screenshot.png)
+![TopStats dashboard](docs/topstats-dashboard.png)
 
 ## Features
 
@@ -30,7 +30,7 @@ Download the latest `TopStats.app` from [Releases](../../releases) and move to `
 ### Option 2: Build from Source
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/TopStats.git
+git clone https://github.com/PFCLEEAI/TopStats.git
 cd TopStats
 
 # Build
