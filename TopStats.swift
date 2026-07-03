@@ -222,6 +222,11 @@ final class SystemStats: ObservableObject {
     private var lastGPUSample = Date.distantPast
     private var lastGPUClientSample = Date.distantPast
     private var latestProcessesByPID: [Int: ProcessSnapshot] = [:]
+    /// Dashboard visibility; read and written only on `workQueue`.
+    private var menuIsOpen = false
+
+    private static let appBundleRegex = try? NSRegularExpression(pattern: #"/([^/]+)\.app/"#)
+    private static let gpuClientPIDRegex = try? NSRegularExpression(pattern: #"pid [0-9]+"#)
 
     init() {
         let (inBytes, outBytes) = getNetworkBytes()
@@ -233,6 +238,8 @@ final class SystemStats: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        // Let the system coalesce timer wakeups (Apple guidance: >=10% tolerance).
+        timer?.tolerance = 1.0
     }
 
     deinit {
@@ -247,42 +254,75 @@ final class SystemStats: ObservableObject {
         sample(forceHeavy: false)
     }
 
+    /// Dashboard menu is opening: resume dashboard-only sampling and refresh everything now.
+    func dashboardWillOpen() {
+        workQueue.async { self.menuIsOpen = true }
+        refreshAll()
+    }
+
+    /// Dashboard closed: the idle loop only needs what the menu-bar title shows.
+    func dashboardDidClose() {
+        workQueue.async { self.menuIsOpen = false }
+    }
+
     private func sample(forceHeavy: Bool) {
         workQueue.async {
-            self.updateCPU()
-            self.updateRAM()
-            self.updateTemperature()
-            self.updateNetwork()
+            let cpu = self.readCPU()
+            let ram = self.readRAM()
+            let temp = self.readTemperature()
+            let net = self.readNetwork()
 
             let now = Date()
+            var gpu: Double?
             if forceHeavy || now.timeIntervalSince(self.lastGPUSample) >= Self.refreshInterval {
-                self.updateGPU()
+                gpu = self.readGPU()
                 self.lastGPUSample = now
             }
 
-            if forceHeavy || now.timeIntervalSince(self.lastProcessSample) >= 10 {
-                self.updateProcessConsumers()
-                self.lastProcessSample = now
+            // The process list (ps) and GPU-client scan (ioreg) only feed the
+            // dashboard, so at idle (menu closed) they are skipped entirely;
+            // the menu-bar title needs none of them.
+            if forceHeavy || self.menuIsOpen {
+                if forceHeavy || now.timeIntervalSince(self.lastProcessSample) >= 10 {
+                    self.updateProcessConsumers()
+                    self.lastProcessSample = now
+                }
+
+                if forceHeavy || now.timeIntervalSince(self.lastGPUClientSample) >= 30 {
+                    self.updateGPUClients()
+                    self.lastGPUClientSample = now
+                }
             }
 
-            if forceHeavy || now.timeIntervalSince(self.lastGPUClientSample) >= 30 {
-                self.updateGPUClients()
-                self.lastGPUClientSample = now
-            }
-
+            // One main-thread hop per tick; assign only values that actually
+            // changed so observers are not invalidated by identical data.
             DispatchQueue.main.async {
-                self.lastUpdated = Date()
+                var changed = false
+                if let cpu, cpu != self.cpuUsage { self.cpuUsage = cpu; changed = true }
+                if let ram {
+                    if ram.used != self.ramUsed { self.ramUsed = ram.used; changed = true }
+                    if ram.free != self.ramFree { self.ramFree = ram.free; changed = true }
+                    if ram.total != self.ramTotal { self.ramTotal = ram.total; changed = true }
+                }
+                if temp.text != self.temperature { self.temperature = temp.text; changed = true }
+                if temp.value != self.temperatureValue { self.temperatureValue = temp.value; changed = true }
+                if let net {
+                    if net.down != self.downloadSpeed { self.downloadSpeed = net.down; changed = true }
+                    if net.up != self.uploadSpeed { self.uploadSpeed = net.up; changed = true }
+                }
+                if let gpu, gpu != self.gpuUsage { self.gpuUsage = gpu; changed = true }
+                if changed { self.lastUpdated = Date() }
             }
         }
     }
 
-    private func updateCPU() {
+    private func readCPU() -> Double? {
         var cpuInfo: processor_info_array_t?
         var numCPUInfo: mach_msg_type_number_t = 0
         var numCPUs: natural_t = 0
 
         let err = host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &numCPUs, &cpuInfo, &numCPUInfo)
-        guard err == KERN_SUCCESS, let info = cpuInfo else { return }
+        guard err == KERN_SUCCESS, let info = cpuInfo else { return nil }
 
         var totalUser: Int32 = 0
         var totalSystem: Int32 = 0
@@ -298,6 +338,7 @@ final class SystemStats: ObservableObject {
         }
 
         let currentInfo = [totalUser, totalSystem, totalIdle, totalNice]
+        var usage: Double?
         if let prev = prevCPUInfo {
             let userDiff = totalUser - prev[0]
             let systemDiff = totalSystem - prev[1]
@@ -305,10 +346,7 @@ final class SystemStats: ObservableObject {
             let niceDiff = totalNice - prev[3]
             let totalDiff = userDiff + systemDiff + idleDiff + niceDiff
             if totalDiff > 0 {
-                let usage = Double(userDiff + systemDiff + niceDiff) / Double(totalDiff) * 100
-                DispatchQueue.main.async {
-                    self.cpuUsage = usage
-                }
+                usage = Double(userDiff + systemDiff + niceDiff) / Double(totalDiff) * 100
             }
         }
 
@@ -318,9 +356,10 @@ final class SystemStats: ObservableObject {
             vm_address_t(bitPattern: info),
             vm_size_t(numCPUInfo) * vm_size_t(MemoryLayout<integer_t>.stride)
         )
+        return usage
     }
 
-    private func updateRAM() {
+    private func readRAM() -> (used: Double, free: Double, total: Double)? {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
 
@@ -330,7 +369,7 @@ final class SystemStats: ObservableObject {
             }
         }
 
-        guard result == KERN_SUCCESS else { return }
+        guard result == KERN_SUCCESS else { return nil }
 
         // Activity Monitor's "Memory Used" = app memory (internal - purgeable) + wired + compressed.
         // Using active pages instead counts reclaimable file cache as used and inactive app pages as free.
@@ -342,11 +381,7 @@ final class SystemStats: ObservableObject {
         let total = Double(ProcessInfo.processInfo.physicalMemory)
         let free = max(0, total - used)
 
-        DispatchQueue.main.async {
-            self.ramUsed = used / 1_073_741_824
-            self.ramFree = free / 1_073_741_824
-            self.ramTotal = total / 1_073_741_824
-        }
+        return (used / 1_073_741_824, free / 1_073_741_824, total / 1_073_741_824)
     }
 
     private struct MemorySnapshot {
@@ -447,12 +482,12 @@ final class SystemStats: ObservableObject {
         }
     }
 
-    private func updateGPU() {
+    private func readGPU() -> Double? {
         guard let output = runCommand("/usr/sbin/ioreg", ["-r", "-d", "1", "-c", "IOAccelerator", "-w", "0"]) else {
-            return
+            return nil
         }
 
-        let gpuValue = output
+        return output
             .split(separator: "\n")
             .lazy
             .compactMap { line -> Double? in
@@ -462,26 +497,16 @@ final class SystemStats: ObservableObject {
                 return Double(digits)
             }
             .first
-
-        guard let gpuValue else { return }
-
-        DispatchQueue.main.async {
-            self.gpuUsage = gpuValue
-        }
     }
 
-    private func updateTemperature() {
+    private func readTemperature() -> (text: String, value: Double) {
         let tempFile = "/tmp/cpu_temp.txt"
         if let tempString = try? String(contentsOfFile: tempFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
            let temp = Double(tempString),
            temp > 0,
            temp < 150 {
-            DispatchQueue.main.async {
-                self.temperature = String(format: "%.0fC", temp)
-                self.temperatureValue = temp
-            }
-            return
+            return (String(format: "%.0fC", temp), temp)
         }
 
         let estimatedTemp: Double
@@ -498,10 +523,7 @@ final class SystemStats: ObservableObject {
             estimatedTemp = 50
         }
 
-        DispatchQueue.main.async {
-            self.temperature = String(format: "~%.0fC", estimatedTemp)
-            self.temperatureValue = estimatedTemp
-        }
+        return (String(format: "~%.0fC", estimatedTemp), estimatedTemp)
     }
 
     private func getNetworkBytes() -> (UInt64, UInt64) {
@@ -530,23 +552,23 @@ final class SystemStats: ObservableObject {
         return (totalIn, totalOut)
     }
 
-    private func updateNetwork() {
+    private func readNetwork() -> (down: Double, up: Double)? {
         let (currentIn, currentOut) = getNetworkBytes()
         let now = Date()
         let elapsed = now.timeIntervalSince(prevNetworkTime)
 
+        var rates: (down: Double, up: Double)?
         if elapsed > 0, prevNetworkIn > 0, currentIn >= prevNetworkIn, currentOut >= prevNetworkOut {
-            let inRate = Double(currentIn - prevNetworkIn) / elapsed
-            let outRate = Double(currentOut - prevNetworkOut) / elapsed
-            DispatchQueue.main.async {
-                self.downloadSpeed = inRate
-                self.uploadSpeed = outRate
-            }
+            rates = (
+                Double(currentIn - prevNetworkIn) / elapsed,
+                Double(currentOut - prevNetworkOut) / elapsed
+            )
         }
 
         prevNetworkIn = currentIn
         prevNetworkOut = currentOut
         prevNetworkTime = now
+        return rates
     }
 
     private func updateProcessConsumers() {
@@ -640,11 +662,12 @@ final class SystemStats: ObservableObject {
     }
 
     private func parseGPUClientLine(_ line: String) -> (pid: Int, name: String)? {
-        guard let pidRange = line.range(of: #"pid [0-9]+"#, options: .regularExpression) else {
+        guard let regex = Self.gpuClientPIDRegex,
+              let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..<line.endIndex, in: line)),
+              let pidRange = Range(match.range, in: line) else {
             return nil
         }
-        let pidText = line[pidRange].replacingOccurrences(of: "pid ", with: "")
-        guard let pid = Int(pidText) else { return nil }
+        guard let pid = Int(line[pidRange].dropFirst(4)) else { return nil }
 
         let name: String
         if let comma = line[pidRange.upperBound...].firstIndex(of: ",") {
@@ -659,7 +682,7 @@ final class SystemStats: ObservableObject {
     }
 
     private func normalizeProcessName(_ command: String) -> String {
-        if let appName = firstRegexCapture(in: command, pattern: #"/([^/]+)\.app/"#) {
+        if let appName = firstRegexCapture(in: command, regex: Self.appBundleRegex) {
             return cleanDisplayName(appName)
         }
 
@@ -690,8 +713,8 @@ final class SystemStats: ObservableObject {
         return cleaned.isEmpty ? "Unknown" : cleaned
     }
 
-    private func firstRegexCapture(in text: String, pattern: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    private func firstRegexCapture(in text: String, regex: NSRegularExpression?) -> String? {
+        guard let regex else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, range: range), match.numberOfRanges > 1 else {
             return nil
@@ -1346,6 +1369,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusRefreshTimer: Timer?
     private var tempHelperProcess: Process?
     private var dashboardHost: NSHostingView<TopStatsDashboardView>?
+    private var dashboardItem: NSMenuItem?
+    private var lastTitle = ""
+    private var lastTooltip = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if settings.launchAtLogin {
@@ -1361,6 +1387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: SystemStats.refreshInterval, repeats: true) { [weak self] _ in
             self?.updateMenuBarTitle()
         }
+        statusRefreshTimer?.tolerance = 1.0
     }
 
     private func observeCommands() {
@@ -1386,17 +1413,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
+        // The 430×706 SwiftUI dashboard is created lazily on first open,
+        // so an idle launch never pays for the view hierarchy.
         let item = NSMenuItem()
-        let host = NSHostingView(rootView: TopStatsDashboardView(stats: stats, settings: settings))
-        host.frame = NSRect(x: 0, y: 0, width: 430, height: 706)
-        item.view = host
         menu.addItem(item)
-        dashboardHost = host
+        dashboardItem = item
         return menu
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        stats.refreshAll()
+        if dashboardHost == nil {
+            let host = NSHostingView(rootView: TopStatsDashboardView(stats: stats, settings: settings))
+            host.frame = NSRect(x: 0, y: 0, width: 430, height: 706)
+            dashboardItem?.view = host
+            dashboardHost = host
+        }
+        stats.dashboardWillOpen()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        stats.dashboardDidClose()
     }
 
     @objc private func openSettings() {
@@ -1429,8 +1465,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateMenuBarTitle() {
         guard let button = statusItem?.button else { return }
-        button.title = menuBarTitle()
-        button.toolTip = menuBarTooltip()
+        // Skip redraws when the rendered strings have not changed.
+        let title = menuBarTitle()
+        if title != lastTitle {
+            lastTitle = title
+            button.title = title
+        }
+        let tooltip = menuBarTooltip()
+        if tooltip != lastTooltip {
+            lastTooltip = tooltip
+            button.toolTip = tooltip
+        }
     }
 
     private func menuBarTitle() -> String {
