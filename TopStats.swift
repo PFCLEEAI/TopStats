@@ -1909,13 +1909,6 @@ struct TopStatsDashboardView: View {
             }
             .buttonStyle(FooterButtonStyle())
 
-            Button {
-                selectedMode = .gpu
-            } label: {
-                Label("GPU Clients", systemImage: "display")
-            }
-            .buttonStyle(FooterButtonStyle())
-
             Spacer()
 
             Button {
@@ -2586,61 +2579,101 @@ struct CodingAgentRow: View {
     }
 }
 
+private struct SettingsSection<Content: View>: View {
+    let icon: String
+    let title: String
+    let accent: Color
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(accent)
+                Text(title)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundColor(Palette.muted)
+            }
+            content
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Palette.panel)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Palette.border, lineWidth: 1)
+                )
+        )
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             Text("TopStats Settings")
                 .font(.system(size: 18, weight: .bold, design: .rounded))
-                .padding(.top, 4)
+                .padding(.top, 14)
 
-            GroupBox("Menu Bar") {
-                VStack(alignment: .leading, spacing: 10) {
+            SettingsSection(icon: "menubar.rectangle", title: "MENU BAR", accent: Palette.cyan) {
+                VStack(alignment: .leading, spacing: 9) {
                     Toggle("CPU", isOn: $settings.showCPU)
                     Toggle("Memory", isOn: $settings.showRAM)
                     Toggle("GPU", isOn: $settings.showGPU)
                     Toggle("Temperature", isOn: $settings.showTemp)
                     Toggle("Network", isOn: $settings.showNetwork)
-                    Divider()
+                    Divider().overlay(Palette.border)
                     Toggle("Compact width", isOn: $settings.compactMenuBar)
                     Text("Drops labels so the title takes less menu bar space — recommended on notched displays, where it competes with every other icon for a fixed-width strip beside the camera housing.")
                         .font(.system(size: 11))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Palette.muted)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(.top, 4)
+                .tint(Palette.cyan)
             }
 
-            GroupBox("Memory") {
-                Picker("Display", selection: $settings.ramShowFree) {
+            SettingsSection(icon: "memorychip", title: "MEMORY", accent: Palette.blue) {
+                Picker("", selection: $settings.ramShowFree) {
                     Text("Used").tag(false)
                     Text("Available").tag(true)
                 }
-                .pickerStyle(.radioGroup)
-                .padding(.top, 4)
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
 
-            GroupBox("Startup") {
+            SettingsSection(icon: "bolt.fill", title: "STARTUP", accent: Palette.purple) {
                 Toggle("Launch at Login", isOn: $settings.launchAtLogin)
-                    .padding(.top, 4)
+                    .tint(Palette.purple)
             }
 
-            Spacer()
+            Spacer(minLength: 0)
 
             HStack {
                 Spacer()
-                Button("Save") {
+                Button {
                     settings.saveSettings()
                     dismiss()
+                } label: {
+                    Text("Save")
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(Palette.ink)
+                        .padding(.horizontal, 22)
+                        .frame(height: 30)
+                        .background(Capsule().fill(Palette.cyan))
                 }
+                .buttonStyle(.plain)
                 .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
             }
         }
         .padding(18)
-        .frame(width: 320, height: 480)
+        .frame(width: 340, height: 520)
+        .background(Palette.ink)
+        .foregroundColor(Palette.text)
     }
 }
 
@@ -2840,15 +2873,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() {
         if settingsWindow == nil {
             let settingsView = SettingsView(settings: settings)
-            settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 320, height: 430),
-                styleMask: [.titled, .closable],
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 520),
+                styleMask: [.titled, .closable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
-            settingsWindow?.contentView = NSHostingView(rootView: settingsView)
-            settingsWindow?.title = "TopStats Settings"
-            settingsWindow?.center()
+            window.contentView = NSHostingView(rootView: settingsView)
+            window.title = "TopStats Settings"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isMovableByWindowBackground = true
+            window.backgroundColor = NSColor(red: 0.08, green: 0.03, blue: 0.16, alpha: 1.0)
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.center()
+            settingsWindow = window
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
