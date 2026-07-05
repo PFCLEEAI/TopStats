@@ -360,6 +360,11 @@ final class SystemStats: ObservableObject {
     /// "Permission denied" signature can't be confirmed on this macOS version.
     private static let lsofPermissionDeniedConfirmed = false
 
+    /// Upper bound on simultaneously-spawned `lsof` cwd-resolution subprocesses
+    /// (Sprint 5 item-g first-open parallelization). Keeps the first-open burst
+    /// short without a fork storm on this busy, background-throttled host.
+    private static let maxConcurrentLsof = 8
+
     /// `mach_host_self()` returns a send right whose uref count grows on every
     /// call (and can overflow after days of 5 s ticks); fetch it once and reuse.
     private static let machHost: mach_port_t = mach_host_self()
@@ -478,13 +483,16 @@ final class SystemStats: ObservableObject {
         // the menu-bar title needs none of them.
         if forceHeavy || menuIsOpen {
             if forceHeavy || now.timeIntervalSince(lastProcessSample) >= 10 {
-                updateProcessConsumers()
-                // Coding Agents ps-based fields ride this SAME 10 s cadence
-                // (no new timer); the extra `codingAgentsTabVisible` gate is
-                // the only thing deciding whether this actually does work.
-                if codingAgentsTabVisible {
-                    updateCodingAgentsOnQueue()
-                }
+                // ONE shared `ps` scan feeds both Top Consumers and (when the
+                // tab is visible) the coding-agent enumeration. Coding Agents
+                // ps-based fields ride this SAME 10 s cadence (no new timer);
+                // the `codingAgentsTabVisible` gate is the only thing deciding
+                // whether the coding-agent work runs. Sprint 5 (item g) fix:
+                // previously this ran three independent full-table `ps` scans
+                // per tick (one here + two in updateCodingAgentsOnQueue); now
+                // it is a single scan, cutting the per-tick cost by ~2/3 on a
+                // ~1000-process host.
+                sampleProcessTable(includeCodingAgents: codingAgentsTabVisible)
                 lastProcessSample = now
             }
 
@@ -809,24 +817,94 @@ final class SystemStats: ObservableObject {
         return rates
     }
 
-    private func updateProcessConsumers() {
-        guard let output = runCommand("/bin/ps", ["-axo", "pid=,pcpu=,rss=,command="]) else { return }
+    /// One row of the shared `ps` scan. Carries every field BOTH the Top
+    /// Consumers aggregation and the coding-agent enumeration need, so a
+    /// single scan replaces the three that used to run per tick.
+    private struct PsRow {
+        let pid: Int32
+        let tty: String
+        let cpu: Double
+        let rssKB: Double
+        let etime: String
+        let lstart: String
+        let command: String   // full argv (ps `command=` / `args=`)
+    }
 
+    /// Parses the shared `ps -axo pid=,tty=,pcpu=,rss=,etime=,lstart=,command=`
+    /// output. The first five fields are single-token; `lstart` is always the
+    /// fixed 5-token "EEE MMM d HH:mm:ss yyyy" form (constant natural width,
+    /// safe as a non-last column per the ps-truncation gotcha in _pm/memory.md);
+    /// `command` is last, so it is taken as the raw remainder of the line WITH
+    /// its internal spacing preserved byte-for-byte — never token-joined, so the
+    /// Top Consumers `normalizeProcessName(command)` result is identical to the
+    /// pre-refactor `pid=,pcpu=,rss=,command=` scan.
+    private func parseCombinedPs(_ output: String) -> [PsRow] {
+        var rows: [PsRow] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            var idx = line.startIndex
+            let end = line.endIndex
+            var fields: [Substring] = []
+            fields.reserveCapacity(10)
+            var complete = true
+            // Consume the 10 leading whitespace-delimited fields
+            // (pid,tty,pcpu,rss,etime + 5 lstart tokens).
+            for _ in 0..<10 {
+                while idx < end, line[idx] == " " { idx = line.index(after: idx) }
+                if idx >= end { complete = false; break }
+                let fieldStart = idx
+                while idx < end, line[idx] != " " { idx = line.index(after: idx) }
+                fields.append(line[fieldStart..<idx])
+            }
+            guard complete, fields.count == 10,
+                  let pid = Int32(fields[0]),
+                  let cpu = Double(fields[2]),
+                  let rssKB = Double(fields[3]) else { continue }
+            // Remainder (after trimming leading spaces) is the command, spacing intact.
+            while idx < end, line[idx] == " " { idx = line.index(after: idx) }
+            let command = String(line[idx..<end])
+            let lstart = fields[5...9].joined(separator: " ")
+            rows.append(PsRow(
+                pid: pid,
+                tty: String(fields[1]),
+                cpu: cpu,
+                rssKB: rssKB,
+                etime: String(fields[4]),
+                lstart: lstart,
+                command: command
+            ))
+        }
+        return rows
+    }
+
+    /// Single shared `ps` scan feeding BOTH the Top Consumers aggregation and
+    /// (when the Coding Agents tab is visible) the coding-agent enumeration.
+    /// Sprint 5 (item g) per-tick cost fix: collapses three independent
+    /// full-table `ps` scans into one. Runs on `workQueue`.
+    private func sampleProcessTable(includeCodingAgents: Bool) {
+        guard let output = runCommand("/bin/ps", ["-axo", "pid=,tty=,pcpu=,rss=,etime=,lstart=,command="]) else { return }
+        let rows = parseCombinedPs(output)
+        updateProcessConsumers(from: rows)
+        if includeCodingAgents {
+            buildCodingAgents(from: rows)
+        }
+    }
+
+    /// Top Consumers aggregation from the shared scan. Byte-for-byte identical
+    /// to the pre-refactor implementation — same `command` string, same
+    /// `normalizeProcessName`, same cpu/rss/sort/prefix — only the `ps`
+    /// invocation is now shared instead of run independently here.
+    private func updateProcessConsumers(from rows: [PsRow]) {
         var byPID: [Int: ProcessSnapshot] = [:]
         var aggregates: [String: ProcessAggregate] = [:]
 
-        for line in output.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            guard parts.count == 4,
-                  let pid = Int(parts[0]),
-                  let cpu = Double(parts[1]),
-                  let rssKB = Double(parts[2]) else {
-                continue
-            }
-
-            let command = String(parts[3])
-            let name = normalizeProcessName(command)
-            let memoryMB = rssKB / 1024
+        for row in rows {
+            // A process with no command was skipped pre-refactor (its line had
+            // < 4 columns) — preserve that so byPID.count / processCount match.
+            guard !row.command.isEmpty else { continue }
+            let pid = Int(row.pid)
+            let cpu = row.cpu
+            let memoryMB = row.rssKB / 1024
+            let name = normalizeProcessName(row.command)
             let snapshot = ProcessSnapshot(pid: pid, name: name, cpuPercent: cpu, memoryMB: memoryMB)
             byPID[pid] = snapshot
 
@@ -870,25 +948,22 @@ final class SystemStats: ObservableObject {
         return result
     }
 
-    /// Runs only while `codingAgentsTabVisible`, and only on the existing
-    /// 10 s `lastProcessSample` cadence already gated on `menuIsOpen` (see
-    /// `sampleBody`) — no new timer. Two `ps` calls rather than one:
-    /// `lstart` and `args` are both variable-width fields that would clobber
-    /// each other if crammed into one non-last column, so each gets its own
-    /// call with itself as the final (unsplit) column.
+    /// Standalone coding-agent refresh for the one-off callers
+    /// (`codingAgentsTabWillAppear()` / `refreshCodingAgents()`). The per-tick
+    /// path does NOT call this — it shares the scan via `sampleProcessTable`.
+    /// Runs its own single combined `ps` scan (Sprint 5 item-g fix: one scan,
+    /// not the two `pid=,tty=,…,lstart=` + `pid=,args=` scans it used before).
     private func updateCodingAgentsOnQueue() {
-        guard let dataOutput = runCommand("/bin/ps", ["-axo", "pid=,tty=,pcpu=,rss=,etime=,lstart="]),
-              let argsOutput = runCommand("/bin/ps", ["-axo", "pid=,args="]) else {
-            return
-        }
+        guard let output = runCommand("/bin/ps", ["-axo", "pid=,tty=,pcpu=,rss=,etime=,lstart=,command="]) else { return }
+        buildCodingAgents(from: parseCombinedPs(output))
+    }
 
-        var argsByPID: [Int32: String] = [:]
-        for line in argsOutput.split(separator: "\n", omittingEmptySubsequences: true) {
-            let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            guard parts.count == 2, let pid = Int32(parts[0]) else { continue }
-            argsByPID[pid] = String(parts[1])
-        }
-
+    /// Coding-agent enumeration from the shared scan rows. Byte-for-byte
+    /// equivalent to the pre-refactor matching loop (same self/ancestor
+    /// exclusion, same `matchCodingAgentBinaryName`, same zombie heuristic,
+    /// same `startTime` capture, same cwd-cache lookup) — only the row source
+    /// changed from two independent `ps` outputs to the one shared scan.
+    private func buildCodingAgents(from rows: [PsRow]) {
         // Hard rule: exclude TopStats's own PID and its full ancestor chain
         // BEFORE any match/filter step below, so a self/ancestor row can
         // never be constructed in the first place (reinforced again in
@@ -898,24 +973,15 @@ final class SystemStats: ObservableObject {
         var results: [CodingAgentProcess] = []
         var keys: [(pid: Int32, lstart: String)] = []
 
-        for line in dataOutput.split(separator: "\n", omittingEmptySubsequences: true) {
-            let tokens = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard tokens.count >= 6,
-                  let pid = Int32(tokens[0]),
-                  !excluded.contains(pid),
-                  let cpu = Double(tokens[2]),
-                  let rssKB = Double(tokens[3]) else { continue }
+        for row in rows {
+            guard !excluded.contains(row.pid) else { continue }
 
-            // One PID's bad/missing args row must never blank/abort the rest
-            // of the list — just skip this PID and keep going.
-            guard let args = argsByPID[pid],
-                  let binaryName = matchCodingAgentBinaryName(args: args) else { continue }
+            // One PID's non-match must never blank/abort the rest of the list —
+            // just skip and keep going.
+            guard let binaryName = matchCodingAgentBinaryName(args: row.command) else { continue }
 
-            let tty = String(tokens[1])
-            let etimeSeconds = parseEtimeSeconds(String(tokens[4]))
-            let lstart = tokens[5...].joined(separator: " ")
-
-            let cacheKey = cwdCacheKey(pid: pid, lstart: lstart)
+            let etimeSeconds = parseEtimeSeconds(row.etime)
+            let cacheKey = cwdCacheKey(pid: row.pid, lstart: row.lstart)
             let cwd: CwdResolution = codingAgentCwdCache[cacheKey].map { .resolved($0) } ?? .unknown
 
             // Zombie flag v1 (see `CodingAgentProcess.isZombie` doc comment):
@@ -924,22 +990,22 @@ final class SystemStats: ObservableObject {
             // to drop a PPID==1 check after live data showed Codex.app's own
             // backend process sits at PPID==1 permanently as normal GUI
             // reparenting, not as a zombie signal — see _pm/work-log.md.
-            let isZombie = tty == "??" && cpu < 0.5 && etimeSeconds > 3600
+            let isZombie = row.tty == "??" && row.cpu < 0.5 && etimeSeconds > 3600
             // Sprint 4: captured here (not re-parsed by the UI layer) so the
             // Kill button can supply `expectedStartTime` to `killAgentProcess`.
-            let startTime = parseLstart(lstart)
+            let startTime = parseLstart(row.lstart)
 
             results.append(CodingAgentProcess(
-                pid: pid,
+                pid: row.pid,
                 binaryName: binaryName,
-                cpuPercent: cpu,
-                rssMB: rssKB / 1024,
+                cpuPercent: row.cpu,
+                rssMB: row.rssKB / 1024,
                 etimeSeconds: etimeSeconds,
                 cwd: cwd,
                 isZombie: isZombie,
                 startTime: startTime
             ))
-            keys.append((pid: pid, lstart: lstart))
+            keys.append((pid: row.pid, lstart: row.lstart))
         }
 
         latestCodingAgentKeys = keys
@@ -1006,22 +1072,64 @@ final class SystemStats: ObservableObject {
         guard !keys.isEmpty else { return }
 
         var resolvedByPID: [Int32: CwdResolution] = [:]
+
+        // Partition: already-cached PIDs resolve instantly and are NEVER
+        // re-queried on reopen; only the uncached ones need an lsof call.
+        var pending: [(pid: Int32, key: String)] = []
         for entry in keys {
             let key = cwdCacheKey(pid: entry.pid, lstart: entry.lstart)
             if let cachedPath = codingAgentCwdCache[key] {
-                // Already-cached PIDs are never re-queried on reopen.
                 resolvedByPID[entry.pid] = .resolved(cachedPath)
-                continue
+            } else {
+                pending.append((pid: entry.pid, key: key))
+            }
+        }
+
+        if !pending.isEmpty {
+            // Sprint 5 (item g) first-open fix: run the uncached lsof lookups
+            // through a BOUNDED concurrent pool instead of one-at-a-time. On a
+            // 37-agent host the sequential pass was ~1.5s (37 × ~40ms, plus any
+            // 2s-timeout stalls serialized); a capped pool overlaps them so the
+            // burst is a few hundred ms and one hung PID can no longer block the
+            // rest. Each lsof KEEPS its own independent 2s timeout inside
+            // `resolveCwd`; the concurrency is capped at `maxConcurrentLsof` to
+            // avoid a fork storm on this busy, throttled host.
+            //
+            // SAFETY: every subprocess spawned here is an `lsof` child THIS pool
+            // creates to READ a target's cwd — it never signals the inspected
+            // process. `resolveCwd`/`runCommandWithTimeout` only ever
+            // terminate() the lsof child they themselves spawned.
+            var results = [CwdResolution](repeating: .unknown, count: pending.count)
+            let pool = DispatchQueue(label: "TopStats.LsofPool", attributes: .concurrent)
+            let gate = DispatchSemaphore(value: Self.maxConcurrentLsof)
+            let group = DispatchGroup()
+            results.withUnsafeMutableBufferPointer { buf in
+                let base = buf.baseAddress!
+                for i in 0..<pending.count {
+                    gate.wait()
+                    group.enter()
+                    let pid = pending[i].pid
+                    pool.async {
+                        // Distinct index per task — no overlapping writes.
+                        (base + i).pointee = self.resolveCwd(forPID: pid)
+                        gate.signal()
+                        group.leave()
+                    }
+                }
+                group.wait()
             }
 
-            // One PID's lsof failure must never blank/abort the rest of the list.
-            let result = resolveCwd(forPID: entry.pid)
-            if case .resolved(let path) = result {
-                codingAgentCwdCache[key] = path
+            // Merge on the workQueue (single-threaded here) so the cache stays
+            // race-free. Only *successful* lookups are cached permanently;
+            // .unknown/.permissionDenied are deliberately never cached so they
+            // retry on the next manual refresh instead of sticking forever.
+            for (i, entry) in pending.enumerated() {
+                let result = results[i]
+                if case .resolved(let path) = result {
+                    codingAgentCwdCache[entry.key] = path
+                }
+                resolvedByPID[entry.pid] = result
             }
-            // Deliberately NOT caching .unknown/.permissionDenied: a failed
-            // lookup must retry on the next manual refresh, not stick forever.
-            resolvedByPID[entry.pid] = result
         }
 
         DispatchQueue.main.async {
