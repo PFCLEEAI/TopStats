@@ -13,6 +13,18 @@ enum ConsumerMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Sprint 4 (coding-agents-ui-section) — user scope-lock decision 1: a
+/// sub-toggle INSIDE the CPU tab's existing card, switching between the
+/// existing "Top Consumers" list (`ConsumerRow`, byte-for-byte unmodified)
+/// and the new "Coding Agents" section. The two never render at once and
+/// share the same 240pt frame (see `TopStatsDashboardView.consumerList`).
+enum CodingAgentsSubView: String, CaseIterable, Identifiable {
+    case topConsumers = "Top Consumers"
+    case codingAgents = "Coding Agents"
+
+    var id: String { rawValue }
+}
+
 struct ProcessConsumer: Identifiable, Hashable {
     var id: String { name }
     let name: String
@@ -52,6 +64,16 @@ struct CodingAgentProcess: Identifiable, Hashable {
     /// false-positive audit both need it attached per-process rather than
     /// recomputed ad hoc by callers.
     let isZombie: Bool
+    /// Parsed epoch time from `ps -o lstart=` (see `SystemStats.parseLstart`),
+    /// captured once per snapshot in `updateCodingAgentsOnQueue`. Added beyond
+    /// the contract's literal struct listing — flagged in `_pm/context.md`'s
+    /// Sprint 3 "Next step" note as required so Sprint 4's Kill button can
+    /// supply `expectedStartTime` to `killAgentProcess`'s TOCTOU guard without
+    /// re-parsing `ps` from the UI layer. `nil` only if `lstart` failed to
+    /// parse (should not happen on this OS — `parseLstart` uses the same
+    /// fixed format Sprint 2 already verified) — the Kill button disables
+    /// itself rather than guessing a start time in that case.
+    let startTime: TimeInterval?
 
     var id: Int32 { pid }
 }
@@ -903,6 +925,9 @@ final class SystemStats: ObservableObject {
             // backend process sits at PPID==1 permanently as normal GUI
             // reparenting, not as a zombie signal — see _pm/work-log.md.
             let isZombie = tty == "??" && cpu < 0.5 && etimeSeconds > 3600
+            // Sprint 4: captured here (not re-parsed by the UI layer) so the
+            // Kill button can supply `expectedStartTime` to `killAgentProcess`.
+            let startTime = parseLstart(lstart)
 
             results.append(CodingAgentProcess(
                 pid: pid,
@@ -911,7 +936,8 @@ final class SystemStats: ObservableObject {
                 rssMB: rssKB / 1024,
                 etimeSeconds: etimeSeconds,
                 cwd: cwd,
-                isZombie: isZombie
+                isZombie: isZombie,
+                startTime: startTime
             ))
             keys.append((pid: pid, lstart: lstart))
         }
@@ -1008,7 +1034,8 @@ final class SystemStats: ObservableObject {
                     rssMB: process.rssMB,
                     etimeSeconds: process.etimeSeconds,
                     cwd: newCwd,
-                    isZombie: process.isZombie
+                    isZombie: process.isZombie,
+                    startTime: process.startTime
                 )
             }
         }
@@ -1530,6 +1557,9 @@ struct TopStatsDashboardView: View {
     @ObservedObject var stats: SystemStats
     @ObservedObject var settings: AppSettings
     @State private var selectedMode: ConsumerMode = .memory
+    /// Sprint 4 — user scope-lock decision 1: sub-toggle inside the CPU tab's
+    /// card only; irrelevant while `selectedMode != .cpu`.
+    @State private var cpuSubView: CodingAgentsSubView = .topConsumers
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1558,7 +1588,16 @@ struct TopStatsDashboardView: View {
                 value: String(format: "%.0f%%", stats.cpuUsage),
                 caption: "\(stats.processCount) processes",
                 accent: usageColor(stats.cpuUsage),
-                gaugeValue: stats.cpuUsage / 100
+                gaugeValue: stats.cpuUsage / 100,
+                // Sprint 4 — replaces the currently-nonexistent CPU "Free Up"
+                // affordance with a real action: jump straight to the CPU
+                // tab's Coding Agents sub-view, matching the Memory card's
+                // existing action pattern above.
+                actionLabel: "Review Agents",
+                action: {
+                    selectedMode = .cpu
+                    cpuSubView = .codingAgents
+                }
             )
             MetricCard(
                 icon: "memorychip",
@@ -1602,23 +1641,40 @@ struct TopStatsDashboardView: View {
     private var consumerList: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(listTitle)
+                Text(headerTitle)
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                 Spacer()
-                Text(listRightLabel)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Palette.muted)
+                // Coding Agents renders its own right-side header content
+                // (refresh action) inside its bordered section — the generic
+                // "% CPU"/"RSS"/"CLIENTS" column label doesn't apply there.
+                if !showsCodingAgents {
+                    Text(listRightLabel)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Palette.muted)
+                }
             }
 
-            ScrollView(.vertical) {
-                VStack(spacing: 8) {
-                    ForEach(activeConsumers) { consumer in
-                        ConsumerRow(
-                            consumer: consumer,
-                            mode: selectedMode,
-                            maxValue: maxRowValue,
-                            accent: accentForMode
-                        )
+            // Sprint 4 — user scope-lock decision 1: sub-toggle lives inside
+            // the CPU tab's card only, above the shared 240pt frame below.
+            if selectedMode == .cpu {
+                cpuSubTogglePicker
+            }
+
+            Group {
+                if showsCodingAgents {
+                    CodingAgentsSection(stats: stats)
+                } else {
+                    ScrollView(.vertical) {
+                        VStack(spacing: 8) {
+                            ForEach(activeConsumers) { consumer in
+                                ConsumerRow(
+                                    consumer: consumer,
+                                    mode: selectedMode,
+                                    maxValue: maxRowValue,
+                                    accent: accentForMode
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1626,6 +1682,23 @@ struct TopStatsDashboardView: View {
         }
         .padding(12)
         .background(cardBackground)
+    }
+
+    private var showsCodingAgents: Bool {
+        selectedMode == .cpu && cpuSubView == .codingAgents
+    }
+
+    private var headerTitle: String {
+        showsCodingAgents ? "CPU" : listTitle
+    }
+
+    private var cpuSubTogglePicker: some View {
+        Picker("", selection: $cpuSubView) {
+            ForEach(CodingAgentsSubView.allCases) { subView in
+                Text(subView.rawValue).tag(subView)
+            }
+        }
+        .pickerStyle(.segmented)
     }
 
     private var footer: some View {
@@ -2005,6 +2078,313 @@ struct ConsumerRow: View {
     }
 }
 
+// MARK: - Coding Agents UI (Sprint 4 — coding-agents-ui-section)
+
+/// Payload for the Kill confirmation flow. The dashboard is an
+/// `NSHostingView` inside an `NSMenuItem` inside `statusItem.menu` — SwiftUI
+/// `.alert`/`.confirmationDialog` is fragile under NSMenu's modal tracking
+/// loop, so Kill routes through a plain `Notification` to `AppDelegate`,
+/// which cancels menu tracking and presents a standalone app-modal `NSAlert`
+/// on the next run-loop tick (see `AppDelegate.handleKillConfirmationRequest`).
+struct KillConfirmationRequest {
+    let pid: Int32
+    let binaryName: String
+    let expectedStartTime: TimeInterval
+    /// Resolved path, or the honest "folder unknown" / "folder access
+    /// denied" fallback text — never fabricated.
+    let cwdDescription: String
+    /// True for `.unknown`/`.permissionDenied` rows — triggers the
+    /// "Folder could not be verified…" prepend and "Kill Anyway" label.
+    let cwdUnresolved: Bool
+    let childCount: Int
+    let isZombie: Bool
+}
+
+extension Notification.Name {
+    static let topStatsRequestKillConfirmation = Notification.Name("TopStatsRequestKillConfirmation")
+}
+
+/// New section behind the CPU tab's Coding Agents sub-toggle, bound to
+/// `CodingAgentProcess` — NOT `ConsumerRow`/`ProcessConsumer` (those stay
+/// byte-for-byte unmodified per the contract).
+struct CodingAgentsSection: View {
+    @ObservedObject var stats: SystemStats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            header
+            if filteredProcesses.isEmpty {
+                emptyState
+            } else {
+                ScrollView(.vertical) {
+                    VStack(spacing: 8) {
+                        ForEach(filteredProcesses) { process in
+                            CodingAgentRow(process: process, stats: stats)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.03))
+        )
+        .overlay(
+            // Persistent muted red/amber border: the destructive Kill action
+            // must never sit where a reflexive Memory/GPU-tab click would land.
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Palette.red.opacity(0.38), lineWidth: 1)
+        )
+        // First-open of the Coding Agents view triggers the coarser lsof cwd
+        // resolution pass (Sprint 1); this fires exactly once per app run the
+        // first time the view actually mounts, and again whenever the user
+        // navigates back to it after leaving (SwiftUI removes/re-adds this
+        // view as `showsCodingAgents` flips) — never on every 10s ps tick.
+        .onAppear { stats.codingAgentsTabWillAppear() }
+        .onDisappear { stats.codingAgentsTabDidDisappear() }
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "terminal.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Palette.red.opacity(0.85))
+            Text("Coding Agents")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+            Spacer()
+            Button {
+                stats.refreshCodingAgents()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(Palette.muted)
+            .help("Refresh coding agents list")
+        }
+    }
+
+    private var emptyState: some View {
+        VStack {
+            Spacer(minLength: 0)
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                Text("No coding agents running")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(Palette.muted)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Defense-in-depth self-PID filter (contract requirement): even though
+    /// Sprint 1's `updateCodingAgentsOnQueue` already excludes TopStats's own
+    /// PID and its full ancestor chain before any row is ever constructed,
+    /// this is a second, independent check at the UI layer. If it ever
+    /// fails, the row is skipped rather than rendered — never a silent
+    /// pass-through.
+    private var filteredProcesses: [CodingAgentProcess] {
+        stats.codingAgentProcesses.filter { process in
+            let isSelf = process.pid == ProcessInfo.processInfo.processIdentifier
+            assert(!isSelf, "CodingAgentsSection: self PID leaked through Sprint 1's exclusion")
+            return !isSelf
+        }
+    }
+}
+
+struct CodingAgentRow: View {
+    let process: CodingAgentProcess
+    @ObservedObject var stats: SystemStats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(process.binaryName)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                        Text("PID \(process.pid)")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(Palette.muted)
+                        if process.isZombie {
+                            zombieBadge
+                        }
+                    }
+                    Text(truncatedCwd)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(Palette.muted)
+                        .lineLimit(1)
+                        .help(cwdTooltip)
+                }
+                Spacer(minLength: 8)
+                actionButtons
+            }
+
+            HStack(spacing: 10) {
+                Text(String(format: "%.1f%% CPU", process.cpuPercent))
+                Text(String(format: "%.0f MB", process.rssMB))
+                Text(uptimeText)
+            }
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundColor(Palette.muted)
+
+            if let killMessage = stats.lastKillResult[process.pid] {
+                Text(killMessage)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Palette.red)
+            }
+            if let throttleMessage = stats.lastThrottleResult[process.pid] {
+                Text(throttleMessage)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Palette.cyan)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.045))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+        )
+    }
+
+    /// Small pill, "Idle 1h+" (never "Zombie") — positioned left/name side,
+    /// separate from the action buttons on the right. Muted yellow at ~0.16
+    /// background opacity with full-opacity text, never `Palette.red`.
+    private var zombieBadge: some View {
+        Text("Idle 1h+")
+            .font(.system(size: 9, weight: .bold, design: .rounded))
+            .foregroundColor(Palette.text)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Palette.yellow.opacity(0.16)))
+            .help("Best-effort signal for orphaned processes — does not detect a stuck sub-agent under an active session.")
+    }
+
+    private var actionButtons: some View {
+        HStack(spacing: 6) {
+            // Throttle: non-destructive, neutral (non-red) style, distinct
+            // shape/color from both Kill (below) and the Memory card's
+            // capsule "Free Up" button.
+            Button {
+                throttle()
+            } label: {
+                Image(systemName: "tortoise.fill")
+                    .frame(width: 15, height: 15)
+            }
+            .buttonStyle(IconButtonStyle(tint: Palette.cyan))
+            .help("Throttle to background (taskpolicy -b) — non-destructive; lasts for this process's lifetime, no un-throttle control exposed yet.")
+
+            // Kill: distinct shape (small icon-button, never the Memory
+            // card's capsule), red-tinted, full confirmation flow.
+            Button {
+                requestKillConfirmation()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .frame(width: 15, height: 15)
+            }
+            .buttonStyle(IconButtonStyle(tint: Palette.red))
+            .disabled(process.startTime == nil)
+            .help(process.startTime == nil
+                ? "Kill unavailable — process start time could not be determined."
+                : "Kill this process")
+        }
+    }
+
+    private func throttle() {
+        let pid = process.pid
+        DispatchQueue.global(qos: .userInitiated).async {
+            stats.throttleAgentProcess(pid: pid)
+        }
+    }
+
+    /// Computes the live child count BEFORE presenting the dialog (per
+    /// `SystemStats.liveChildCount`'s doc comment), then hands off to
+    /// `AppDelegate` via notification — never presents a SwiftUI
+    /// `.alert`/`.confirmationDialog` directly from inside the menu-hosted view.
+    private func requestKillConfirmation() {
+        guard let startTime = process.startTime else { return }
+        let pid = process.pid
+        let binaryName = process.binaryName
+        let cwdDescription = self.cwdDescriptionForDialog
+        let cwdUnresolved = self.cwdUnresolvedForDialog
+        let isZombie = process.isZombie
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let childCount = stats.liveChildCount(ofPID: pid)
+            let request = KillConfirmationRequest(
+                pid: pid,
+                binaryName: binaryName,
+                expectedStartTime: startTime,
+                cwdDescription: cwdDescription,
+                cwdUnresolved: cwdUnresolved,
+                childCount: childCount,
+                isZombie: isZombie
+            )
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .topStatsRequestKillConfirmation, object: request)
+            }
+        }
+    }
+
+    /// Middle-elision preserving the final path component + immediate
+    /// parent — never naive tail-truncation. Unknown/denied states are shown
+    /// plainly (nothing to elide), matching `cwdDescriptionForDialog`.
+    private var truncatedCwd: String {
+        switch process.cwd {
+        case .resolved(let path):
+            return Self.middleElide(path)
+        case .unknown:
+            return "folder unknown"
+        case .permissionDenied:
+            return "folder access denied"
+        }
+    }
+
+    private var cwdTooltip: String {
+        switch process.cwd {
+        case .resolved(let path): return path
+        case .unknown: return "folder unknown"
+        case .permissionDenied: return "folder access denied"
+        }
+    }
+
+    private var cwdDescriptionForDialog: String { cwdTooltip }
+
+    private var cwdUnresolvedForDialog: Bool {
+        switch process.cwd {
+        case .resolved: return false
+        case .unknown, .permissionDenied: return true
+        }
+    }
+
+    private static func middleElide(_ path: String, limit: Int = 40) -> String {
+        guard path.count > limit else { return path }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard components.count > 2 else { return path }
+        let leaf = components[components.count - 1]
+        let parent = components[components.count - 2]
+        return ".../\(parent)/\(leaf)"
+    }
+
+    private var uptimeText: String {
+        let seconds = process.etimeSeconds
+        if seconds >= 3600 {
+            return String(format: "%dh %02dm", seconds / 3600, (seconds % 3600) / 60)
+        }
+        if seconds >= 60 {
+            return String(format: "%dm %02ds", seconds / 60, seconds % 60)
+        }
+        return "\(seconds)s"
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @Environment(\.dismiss) private var dismiss
@@ -2139,6 +2519,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(quitApp), name: .topStatsQuit, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screenParametersChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleKillConfirmationRequest(_:)), name: .topStatsRequestKillConfirmation, object: nil)
+    }
+
+    // MARK: Coding Agents — Kill confirmation (Sprint 4)
+
+    /// The dashboard is an `NSHostingView` inside an `NSMenuItem` inside
+    /// `statusItem.menu` — SwiftUI's `.alert`/`.confirmationDialog` is
+    /// fragile under NSMenu's modal tracking loop. Concretely: (1) cancel the
+    /// menu's tracking loop, (2) on the next run-loop tick present a
+    /// standalone, app-modal `NSAlert` via `.runModal()` — independent of
+    /// menu tracking — (3) proceed to `killAgentProcess` only on confirm.
+    @objc private func handleKillConfirmationRequest(_ notification: Notification) {
+        guard let request = notification.object as? KillConfirmationRequest else { return }
+        statusItem?.menu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            self?.presentKillConfirmation(request)
+        }
+    }
+
+    private func presentKillConfirmation(_ request: KillConfirmationRequest) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Kill \(request.binaryName) (PID \(request.pid))?"
+
+        // Dialog copy is assembled inside-out: base sentence + always-on
+        // SIGTERM/SIGKILL explainer, then the unresolved-cwd prepend, then
+        // the not-idle prepend outermost — see contract Sprint 4 "Dialog copy".
+        var informative = "Running from: \(request.cwdDescription)"
+        if request.childCount > 0 {
+            informative += " This process has \(request.childCount) child process(es) that will not be stopped by this action."
+        }
+        informative += " This sends a termination signal (SIGTERM) first; if the process does not stop within 3 seconds, this app will force-stop it (SIGKILL)."
+        if request.cwdUnresolved {
+            informative = "Folder could not be verified for this process. " + informative
+        }
+        if !request.isZombie {
+            informative = "This does not look idle — it may be an active session. " + informative
+        }
+        alert.informativeText = informative
+
+        // Cancel is first/default (Return key); Kill/Kill Anyway is second,
+        // non-default, red-styled — explicit keyEquivalents so this holds
+        // regardless of NSAlert's own title-based defaulting behavior.
+        let cancelButton = alert.addButton(withTitle: "Cancel")
+        cancelButton.keyEquivalent = "\r"
+        let killTitle = request.cwdUnresolved ? "Kill Anyway" : "Kill"
+        let killButton = alert.addButton(withTitle: killTitle)
+        killButton.keyEquivalent = ""
+        if #available(macOS 11.0, *) {
+            killButton.hasDestructiveAction = true
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            stats.killAgentProcess(
+                pid: request.pid,
+                expectedBinaryName: request.binaryName,
+                expectedStartTime: request.expectedStartTime
+            )
+        }
     }
 
     // On multi-display setups (especially with a mirrored primary display alongside
