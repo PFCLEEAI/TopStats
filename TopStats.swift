@@ -948,6 +948,61 @@ final class SystemStats: ObservableObject {
         return result
     }
 
+    /// Outcome of the fresh, call-time ancestor-chain safety re-check.
+    private enum AncestorCheckResult {
+        /// Target PID is NOT this app's own PID nor anywhere in its live
+        /// ancestor chain — safe to act on.
+        case clear
+        /// Target PID IS this app itself or one of its ancestors — must abort.
+        case isSelfOrAncestor
+        /// The `ps` walk could not be completed (a read failed, a PID vanished
+        /// mid-walk, or the hop cap was hit), so the chain is INCOMPLETE. The
+        /// caller must fail closed and refuse to act — a truncated chain is
+        /// never treated as a clean pass.
+        case inconclusive(String)
+    }
+
+    /// Genuinely independent, freshly-computed ancestor-chain check performed
+    /// immediately before a kill/throttle actually acts. Unlike the one-time
+    /// `codingAgentSelfExclusionSet` captured at enumeration time, this walks
+    /// `ps -o ppid=` from TopStats's own LIVE PID up to PID 1 AT CALL TIME and
+    /// does not reuse any cached set — so a PID that only became an ancestor
+    /// (or a stale cache) cannot slip a self/ancestor through to `kill()`.
+    ///
+    /// FAIL CLOSED: the original enumeration walk silently `break`s (truncates)
+    /// on any transient `ps` failure and returns whatever partial set it had.
+    /// This function refuses that behavior — if any hop cannot be read or
+    /// parsed, it returns `.inconclusive` so the caller aborts rather than
+    /// proceeding on an incomplete chain.
+    private func liveAncestorCheck(target pid: Int32) -> AncestorCheckResult {
+        let selfPID = ProcessInfo.processInfo.processIdentifier
+        if pid == selfPID { return .isSelfOrAncestor }
+
+        var current = selfPID
+        var hops = 0
+        while current > 1, hops < 4096 {
+            guard let raw = runCommand("/bin/ps", ["-o", "ppid=", "-p", "\(current)"]) else {
+                return .inconclusive("could not read parent of PID \(current)")
+            }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Empty output means the PID vanished mid-walk (e.g. our own parent
+            // exited); the chain is no longer trustworthy — fail closed.
+            if trimmed.isEmpty {
+                return .inconclusive("no parent reported for PID \(current)")
+            }
+            guard let ppid = Int32(trimmed), ppid > 0 else {
+                return .inconclusive("unparseable parent \"\(trimmed)\" for PID \(current)")
+            }
+            if ppid == pid { return .isSelfOrAncestor }
+            if ppid == 1 { return .clear }
+            current = ppid
+            hops += 1
+        }
+        // Loop ended by hitting the hop cap (or current<=1 without seeing PID 1)
+        // rather than a clean walk to init — treat as inconclusive, not clear.
+        return .inconclusive("ancestor walk did not reach PID 1 (hops=\(hops))")
+    }
+
     /// Standalone coding-agent refresh for the one-off callers
     /// (`codingAgentsTabWillAppear()` / `refreshCodingAgents()`). The per-tick
     /// path does NOT call this — it shares the scan via `sampleProcessTable`.
@@ -964,10 +1019,14 @@ final class SystemStats: ObservableObject {
     /// same `startTime` capture, same cwd-cache lookup) — only the row source
     /// changed from two independent `ps` outputs to the one shared scan.
     private func buildCodingAgents(from rows: [PsRow]) {
-        // Hard rule: exclude TopStats's own PID and its full ancestor chain
-        // BEFORE any match/filter step below, so a self/ancestor row can
-        // never be constructed in the first place (reinforced again in
-        // Sprint 4's UI layer as a second, independent check).
+        // Exclude TopStats's own PID and its ancestor chain (captured once at
+        // enumeration time in `codingAgentSelfExclusionSet`) BEFORE any
+        // match/filter step below, so a self/ancestor row is normally never
+        // constructed in the first place. This is the enumeration-time filter
+        // only; the authoritative, fail-closed protection is the fresh
+        // `liveAncestorCheck` re-run immediately before any kill/throttle acts
+        // (see `performKill` / `throttleAgentProcess`). The UI layer additionally
+        // asserts on the self PID but does NOT re-walk the ancestor chain.
         let excluded = codingAgentSelfExclusionSet
 
         var results: [CodingAgentProcess] = []
@@ -1017,8 +1076,12 @@ final class SystemStats: ObservableObject {
 
     /// Rule (a): top-level CLI agents match ONLY an exact basename in the
     /// allowed set, where the resolved executable path does not run through
-    /// a GUI app bundle's `Contents/MacOS/` and the command line carries no
-    /// Electron/Sparkle child markers — GUI wrapper apps are out of scope.
+    /// ANY `.app` bundle's `Contents/` subtree (MacOS, Resources, Frameworks,
+    /// etc.) and the command line carries no Electron/Sparkle child markers —
+    /// GUI wrapper apps and their bundled backends are out of scope. This
+    /// specifically excludes Codex.app's own live backend
+    /// (`…/Codex.app/Contents/Resources/codex app-server`), which lives under
+    /// `Contents/Resources/` and would otherwise appear as a killable "codex".
     /// Rule (b): MCP/Playwright children match by FULL COMMAND LINE
     /// substring only — this never matches bare `node` by name alone.
     private func matchCodingAgentBinaryName(args: String) -> String? {
@@ -1027,7 +1090,7 @@ final class SystemStats: ObservableObject {
         let basename = URL(fileURLWithPath: firstToken).lastPathComponent
 
         if Self.cliAgentBasenames.contains(basename) {
-            if firstToken.contains("/Contents/MacOS/") { return nil }
+            if firstToken.contains(".app/Contents/") { return nil }
             for marker in Self.electronChildMarkers where args.contains(marker) {
                 return nil
             }
@@ -1270,12 +1333,20 @@ final class SystemStats: ObservableObject {
     }
 
     private func performKill(pid: Int32, expectedBinaryName: String, expectedStartTime: TimeInterval) {
-        // Defense-in-depth (on top of Sprint 1's self/ancestor candidate
-        // exclusion and Sprint 4's UI-layer assert): the app must never signal
-        // its own PID, even if a caller passes it by mistake.
-        guard pid != ProcessInfo.processInfo.processIdentifier else {
-            publishKillResult(pid, "process no longer matches — kill cancelled")
+        // Independent, freshly-computed ancestor-chain re-check at the moment of
+        // action (NOT a reuse of the enumeration-time `codingAgentSelfExclusionSet`):
+        // walk ps from this app's own live PID up to PID 1 right now and refuse
+        // if the target is this app or any of its live ancestors. Fails closed
+        // if the walk is inconclusive.
+        switch liveAncestorCheck(target: pid) {
+        case .isSelfOrAncestor:
+            publishKillResult(pid, "kill cancelled — target is TopStats itself or one of its ancestors")
             return
+        case .inconclusive(let why):
+            publishKillResult(pid, "kill cancelled — ancestor safety check inconclusive (\(why))")
+            return
+        case .clear:
+            break
         }
 
         // TOCTOU guard: fresh-read the live identity RIGHT NOW and require BOTH
@@ -1440,9 +1511,11 @@ final class SystemStats: ObservableObject {
     /// built, since no such control exists yet even though the underlying
     /// flag does.
     ///
-    /// Same self/ancestor exclusion as Sprint 1/2 applies automatically
-    /// because the candidate list already excludes TopStats — this is a
-    /// defense-in-depth guard on top of that, matching `performKill`'s.
+    /// Before acting, this performs a fresh, independent ancestor-chain
+    /// re-check (`liveAncestorCheck`) computed at call time — the same guard as
+    /// `performKill` — so it never throttles this app or any of its live
+    /// ancestors, and refuses to act (fail closed) if that check is
+    /// inconclusive. This does not rely on the enumeration-time exclusion set.
     ///
     /// This spawns a subprocess synchronously and should be called off the
     /// main thread (e.g. via `agentActionQueue`, same as `killAgentProcess`)
@@ -1450,10 +1523,21 @@ final class SystemStats: ObservableObject {
     /// `_pm/work-log.md`) — well under Sprint 5's <300 ms sampling-burst bound.
     @discardableResult
     func throttleAgentProcess(pid: Int32) -> ThrottleResult {
-        guard pid != ProcessInfo.processInfo.processIdentifier else {
-            let message = "cannot throttle this app's own process"
+        // Independent, freshly-computed ancestor-chain re-check at the moment of
+        // action (same guard as `performKill`, NOT a reuse of the cached
+        // enumeration-time set): never throttle this app or any of its live
+        // ancestors. Fails closed if the walk is inconclusive.
+        switch liveAncestorCheck(target: pid) {
+        case .isSelfOrAncestor:
+            let message = "target is TopStats itself or one of its ancestors"
             publishThrottleResult(pid, "Failed: \(message)")
             return .failed(message)
+        case .inconclusive(let why):
+            let message = "ancestor safety check inconclusive (\(why))"
+            publishThrottleResult(pid, "Failed: \(message)")
+            return .failed(message)
+        case .clear:
+            break
         }
 
         let outcome = runCommandWithTimeout("/usr/sbin/taskpolicy", ["-b", "-p", "\(pid)"], timeout: 2.0)
@@ -1678,7 +1762,14 @@ struct TopStatsDashboardView: View {
             footer
         }
         .padding(16)
-        .frame(width: 430, height: 706, alignment: .topLeading)
+        // Height 706 → 740: the CPU tab adds the `cpuSubTogglePicker`
+        // (segmented control ~23pt + one 10pt VStack gap ≈ 33pt) inside the
+        // card. The prior 706 was tuned to the pre-picker (non-CPU) content
+        // (measured ~702pt), leaving no room, so the CPU tab overflowed and
+        // clipped the footer. 740 restores fit for the tallest (CPU) tab with
+        // a few pt of margin. Same fixed-frame-for-all-tabs pattern as the
+        // earlier 680→724→706 adjustments.
+        .frame(width: 430, height: 740, alignment: .topLeading)
         .background(Palette.ink)
         .foregroundColor(Palette.text)
     }
@@ -2288,11 +2379,13 @@ struct CodingAgentsSection: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Defense-in-depth self-PID filter (contract requirement): even though
-    /// Sprint 1's `updateCodingAgentsOnQueue` already excludes TopStats's own
-    /// PID and its full ancestor chain before any row is ever constructed,
-    /// this is a second, independent check at the UI layer. If it ever
-    /// fails, the row is skipped rather than rendered — never a silent
+    /// Defense-in-depth self-PID filter at the UI layer: this checks ONLY that
+    /// a row is not TopStats's own PID (it does NOT re-walk the ancestor
+    /// chain — that authoritative, fail-closed ancestor re-check happens fresh
+    /// at kill/throttle time in `liveAncestorCheck`). The enumeration step
+    /// (`buildCodingAgents`) already excludes self+ancestors via the cached
+    /// set, so this is a last-line render guard: if a self PID ever leaked
+    /// through, the row is skipped rather than rendered — never a silent
     /// pass-through.
     private var filteredProcesses: [CodingAgentProcess] {
         stats.codingAgentProcesses.filter { process in
@@ -2722,7 +2815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        // The 430×706 SwiftUI dashboard is created lazily on first open,
+        // The 430×740 SwiftUI dashboard is created lazily on first open,
         // so an idle launch never pays for the view hierarchy.
         let item = NSMenuItem()
         menu.addItem(item)
@@ -2733,7 +2826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         if dashboardHost == nil {
             let host = NSHostingView(rootView: TopStatsDashboardView(stats: stats, settings: settings))
-            host.frame = NSRect(x: 0, y: 0, width: 430, height: 706)
+            host.frame = NSRect(x: 0, y: 0, width: 430, height: 740)
             dashboardItem?.view = host
             dashboardHost = host
         }
