@@ -257,6 +257,10 @@ final class SystemStats: ObservableObject {
     @Published var isFreeingMemory = false
     @Published var lastFreeUpResult: String?
     @Published var codingAgentProcesses: [CodingAgentProcess] = []
+    /// Sprint 2 — scoped-kill-action. Per-PID transient outcome message,
+    /// mirroring `lastFreeUpResult`'s ~12 s auto-clear (see `publishKillResult`).
+    /// Keyed by PID so each Coding Agents row surfaces only its own result.
+    @Published var lastKillResult: [Int32: String] = [:]
 
     /// Invoked on the main queue after every sample tick; the menu-bar title
     /// refresh piggybacks on this instead of running its own 5 s timer.
@@ -264,6 +268,10 @@ final class SystemStats: ObservableObject {
 
     private let workQueue = DispatchQueue(label: "TopStats.Sampler", qos: .utility)
     private let cleanerQueue = DispatchQueue(label: "TopStats.MemoryCleaner", qos: .userInitiated)
+    /// Sprint 2 — scoped-kill-action runs off both the main queue and the
+    /// sampler `workQueue`: its SIGTERM→poll→SIGKILL flow blocks for up to ~5 s
+    /// on `Thread.sleep`, which must never stall metric sampling or the UI.
+    private let agentActionQueue = DispatchQueue(label: "TopStats.AgentAction", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var prevCPUInfo: [Int32]?
     private var prevNetworkIn: UInt64 = 0
@@ -328,6 +336,17 @@ final class SystemStats: ObservableObject {
     /// `mach_host_self()` returns a send right whose uref count grows on every
     /// call (and can overflow after days of 5 s ticks); fetch it once and reuse.
     private static let machHost: mach_port_t = mach_host_self()
+
+    /// Sprint 2: parses BSD `ps -o lstart=` ("Sat Jul  5 16:36:00 2026") for
+    /// the kill-time TOCTOU start-time re-check. POSIX locale + fixed pattern;
+    /// double-space day padding is collapsed before parsing (see `parseLstart`).
+    private static let lstartFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        f.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return f
+    }()
 
     init() {
         let (inBytes, outBytes) = getNetworkBytes()
@@ -991,6 +1010,9 @@ final class SystemStats: ObservableObject {
     }
 
     private func resolveCwd(forPID pid: Int32) -> CwdResolution {
+        // SAFETY: this lsof access works only while TopStats stays ad-hoc-signed
+        // with no App Sandbox entitlement — see _pm/memory.md "Coding Agents
+        // feature" gotcha; re-verify before any signing/notarization change.
         let result = runCommandWithTimeout("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"], timeout: 2.0)
 
         if result.timedOut {
@@ -1068,6 +1090,178 @@ final class SystemStats: ObservableObject {
             process.terminationStatus,
             false
         )
+    }
+
+    // MARK: Coding Agents — Scoped Kill (Sprint 2 — scoped-kill-action)
+
+    /// Live count of a target PID's immediate children, for the Sprint 4
+    /// confirmation dialog. v1 signals ONLY the target PID — these children are
+    /// orphaned, not reclaimed; the dialog copy states that explicitly. Called
+    /// by the caller BEFORE presenting the dialog, not from inside `killAgentProcess`.
+    func liveChildCount(ofPID pid: Int32) -> Int {
+        guard let out = runCommand("/usr/bin/pgrep", ["-P", "\(pid)"]) else { return 0 }
+        return out.split(separator: "\n")
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+            .count
+    }
+
+    /// Scoped, TOCTOU-guarded kill of a single coding-agent PID. Re-verifies the
+    /// live process identity (matched binary name AND start time — never name
+    /// alone, which fails against PID reuse with concurrent same-named
+    /// node/chrome-headless-shell instances) immediately before signaling; on
+    /// any mismatch it aborts WITHOUT signaling. On match: SIGTERM, poll up to
+    /// 3 s, then one SIGKILL + poll up to 2 s. Every outcome is recorded to
+    /// `lastKillResult[pid]` — success is never assumed silently.
+    ///
+    /// SAFETY: kill() reaches non-child PIDs only while TopStats stays
+    /// ad-hoc-signed with no App Sandbox entitlement — see _pm/memory.md
+    /// "Coding Agents feature" gotcha; re-verify before any signing change.
+    func killAgentProcess(pid: Int32, expectedBinaryName: String, expectedStartTime: TimeInterval) {
+        agentActionQueue.async { [weak self] in
+            self?.performKill(pid: pid, expectedBinaryName: expectedBinaryName, expectedStartTime: expectedStartTime)
+        }
+    }
+
+    private enum KillSignalOutcome {
+        case signaled
+        case alreadyGone       // ESRCH — no such process (already exited)
+        case permissionDenied  // EPERM — cannot signal this process
+        case otherError(Int32)
+    }
+
+    private func performKill(pid: Int32, expectedBinaryName: String, expectedStartTime: TimeInterval) {
+        // Defense-in-depth (on top of Sprint 1's self/ancestor candidate
+        // exclusion and Sprint 4's UI-layer assert): the app must never signal
+        // its own PID, even if a caller passes it by mistake.
+        guard pid != ProcessInfo.processInfo.processIdentifier else {
+            publishKillResult(pid, "process no longer matches — kill cancelled")
+            return
+        }
+
+        // TOCTOU guard: fresh-read the live identity RIGHT NOW and require BOTH
+        // the matched binary name AND the start time to equal what was captured
+        // when the user clicked Kill. A gone/reused/swapped PID fails here and
+        // is never signaled.
+        let (liveName, liveStart) = freshIdentity(ofPID: pid)
+        guard let liveName, let liveStart,
+              liveName == expectedBinaryName,
+              abs(liveStart - expectedStartTime) < 1.5 else {
+            publishKillResult(pid, "process no longer matches — kill cancelled")
+            return
+        }
+
+        // Identity confirmed — SIGTERM first, inspecting the syscall's own errno.
+        // SAFETY: see _pm/memory.md "Coding Agents feature" — kill() access
+        // depends on TopStats remaining ad-hoc-signed with no App Sandbox.
+        switch signalAndClassify(pid: pid, signal: SIGTERM) {
+        case .alreadyGone:
+            publishKillResult(pid, "already exited")
+            return
+        case .permissionDenied:
+            // Ad-hoc signed with zero entitlements and no OS backstop — never
+            // silently no-op, and never escalate to SIGKILL.
+            publishKillResult(pid, "Permission denied — this process cannot be terminated by this app.")
+            return
+        case .otherError(let e):
+            publishKillResult(pid, "kill failed (errno \(e))")
+            return
+        case .signaled:
+            break
+        }
+
+        // Poll every 250 ms up to 3 s for a graceful exit.
+        if pollForExit(pid: pid, deadline: 3.0) {
+            publishKillResult(pid, "terminated")
+            return
+        }
+
+        // Still alive after 3 s — escalate to a single SIGKILL (same errno rules).
+        switch signalAndClassify(pid: pid, signal: SIGKILL) {
+        case .alreadyGone:
+            // Exited in the race between the last poll and this SIGKILL: SIGTERM won.
+            publishKillResult(pid, "terminated")
+            return
+        case .permissionDenied:
+            publishKillResult(pid, "Permission denied — this process cannot be terminated by this app.")
+            return
+        case .otherError(let e):
+            publishKillResult(pid, "force-stop failed (errno \(e))")
+            return
+        case .signaled:
+            break
+        }
+
+        if pollForExit(pid: pid, deadline: 2.0) {
+            publishKillResult(pid, "force-stopped")
+        } else {
+            publishKillResult(pid, "still running — could not stop")
+        }
+    }
+
+    /// Sends `sig` to `pid` and classifies the result by the syscall's own
+    /// errno. `sig == 0` (no signal) doubles as a liveness probe.
+    private func signalAndClassify(pid: Int32, signal sig: Int32) -> KillSignalOutcome {
+        if kill(pid, sig) == 0 { return .signaled }
+        switch errno {
+        case ESRCH: return .alreadyGone
+        case EPERM: return .permissionDenied
+        default:    return .otherError(errno)
+        }
+    }
+
+    /// True once the PID is gone. `kill(pid, 0)` returning EPERM means the
+    /// process still exists (owned by someone we can't signal) → still alive.
+    private func processIsAlive(_ pid: Int32) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Polls every 250 ms until `deadline` seconds elapse; returns true as soon
+    /// as the PID has exited. Runs on `agentActionQueue`, never main/workQueue.
+    private func pollForExit(pid: Int32, deadline seconds: TimeInterval) -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if !processIsAlive(pid) { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return !processIsAlive(pid)
+    }
+
+    /// Fresh, at-signal-time identity read: the matched coding-agent binary
+    /// name (re-run through the exact Sprint 1 matcher, so a PID that is no
+    /// longer a coding agent reads as `nil`) and the start time parsed from
+    /// `ps -o lstart=`. Two `ps` calls keep each variable/fixed field unsplit.
+    private func freshIdentity(ofPID pid: Int32) -> (binaryName: String?, startTime: TimeInterval?) {
+        let args = runCommand("/bin/ps", ["-p", "\(pid)", "-o", "args="])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = (args?.isEmpty == false) ? matchCodingAgentBinaryName(args: args!) : nil
+
+        let lstart = runCommand("/bin/ps", ["-p", "\(pid)", "-o", "lstart="])?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let start = (lstart?.isEmpty == false) ? parseLstart(lstart!) : nil
+
+        return (name, start)
+    }
+
+    /// Parses a BSD `lstart` string into an epoch `TimeInterval`. Collapses the
+    /// space-padded single-digit day ("Jul  5" → "Jul 5") so `DateFormatter`
+    /// with a fixed pattern parses cleanly.
+    private func parseLstart(_ lstart: String) -> TimeInterval? {
+        let normalized = lstart.split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+        return Self.lstartFormatter.date(from: normalized)?.timeIntervalSince1970
+    }
+
+    /// Publishes a per-PID kill outcome and schedules the same ~12 s auto-clear
+    /// as `lastFreeUpResult`, clearing only if the message hasn't been replaced.
+    private func publishKillResult(_ pid: Int32, _ message: String) {
+        DispatchQueue.main.async {
+            self.lastKillResult[pid] = message
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                if self.lastKillResult[pid] == message {
+                    self.lastKillResult[pid] = nil
+                }
+            }
+        }
     }
 
     private func updateGPUClients() {
