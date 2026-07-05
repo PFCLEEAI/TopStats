@@ -261,6 +261,11 @@ final class SystemStats: ObservableObject {
     /// mirroring `lastFreeUpResult`'s ~12 s auto-clear (see `publishKillResult`).
     /// Keyed by PID so each Coding Agents row surfaces only its own result.
     @Published var lastKillResult: [Int32: String] = [:]
+    /// Sprint 3 — throttle-action. Same per-PID transient-message pattern as
+    /// `lastKillResult` ("Throttled" / "Failed: <reason>"), ~12 s auto-clear
+    /// (see `publishThrottleResult`). Separate dict from `lastKillResult` so a
+    /// row can show independent Kill and Throttle outcomes at once.
+    @Published var lastThrottleResult: [Int32: String] = [:]
 
     /// Invoked on the main queue after every sample tick; the menu-bar title
     /// refresh piggybacks on this instead of running its own 5 s timer.
@@ -1259,6 +1264,89 @@ final class SystemStats: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
                 if self.lastKillResult[pid] == message {
                     self.lastKillResult[pid] = nil
+                }
+            }
+        }
+    }
+
+    // MARK: Coding Agents — Throttle (Sprint 3 — throttle-action)
+
+    /// Outcome of a single `taskpolicy -b` background-throttle attempt.
+    enum ThrottleResult: Equatable {
+        case throttled
+        case failed(String)
+    }
+
+    /// Non-destructive background throttle for one coding-agent PID via
+    /// `taskpolicy -b -p <pid>` — the same mechanism as the system-wide
+    /// `~/.local/bin/background-throttle.sh` (see
+    /// `~/.claude/rules/computer-settings.md` §4b): pins the process to
+    /// `PRIO_DARWIN_BG` (efficiency-core / throttled-IO scheduling). No
+    /// confirmation dialog required (user scope-lock decision 2) and
+    /// idempotent — re-running `-b` against an already-throttled PID is a
+    /// safe no-op (confirmed live against a decoy, see `_pm/work-log.md`:
+    /// `ps -o pri=` dropped 31→4 on first call and stayed at 4 on a second
+    /// call, exit 0 both times).
+    ///
+    /// DEVIATION FROM CONTRACT: the contract specified `/usr/bin/taskpolicy`;
+    /// on this machine/macOS version that path does not exist (`which
+    /// taskpolicy` resolves to `/usr/sbin/taskpolicy`; `/usr/bin/taskpolicy`
+    /// is verified absent). Using the contract's literal path would make
+    /// every call fail with "no such file" — using the real, verified path so
+    /// the feature actually functions.
+    ///
+    /// REVERSIBILITY: `man taskpolicy` on this macOS version documents `-B`
+    /// ("Move target process out of PRIO_DARWIN_BG") as the literal inverse of
+    /// `-b`, and a live decoy test (`_pm/work-log.md`) confirmed `-B -p <pid>`
+    /// exits 0 and restores the pre-throttle `pri` value. This app does NOT
+    /// expose an un-throttle action in v1 (out of this sprint's scope) — any
+    /// future UI copy or "undo" affordance must say this lasts for the
+    /// process's lifetime unless/until a separate un-throttle control is
+    /// built, since no such control exists yet even though the underlying
+    /// flag does.
+    ///
+    /// Same self/ancestor exclusion as Sprint 1/2 applies automatically
+    /// because the candidate list already excludes TopStats — this is a
+    /// defense-in-depth guard on top of that, matching `performKill`'s.
+    ///
+    /// This spawns a subprocess synchronously and should be called off the
+    /// main thread (e.g. via `agentActionQueue`, same as `killAgentProcess`)
+    /// once wired to a UI action. Live-measured at ~2-4 ms per call (see
+    /// `_pm/work-log.md`) — well under Sprint 5's <300 ms sampling-burst bound.
+    @discardableResult
+    func throttleAgentProcess(pid: Int32) -> ThrottleResult {
+        guard pid != ProcessInfo.processInfo.processIdentifier else {
+            let message = "cannot throttle this app's own process"
+            publishThrottleResult(pid, "Failed: \(message)")
+            return .failed(message)
+        }
+
+        let outcome = runCommandWithTimeout("/usr/sbin/taskpolicy", ["-b", "-p", "\(pid)"], timeout: 2.0)
+
+        if outcome.timedOut {
+            publishThrottleResult(pid, "Failed: timed out")
+            return .failed("timed out")
+        }
+        if outcome.exitCode == 0 {
+            publishThrottleResult(pid, "Throttled")
+            return .throttled
+        }
+
+        let stderrText = outcome.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reason = stderrText.isEmpty ? "exit \(outcome.exitCode)" : stderrText
+        publishThrottleResult(pid, "Failed: \(reason)")
+        return .failed(reason)
+    }
+
+    /// Publishes a per-PID throttle outcome using the identical transient
+    /// pattern as `publishKillResult` (~12 s auto-clear, cleared only if the
+    /// message hasn't since been replaced).
+    private func publishThrottleResult(_ pid: Int32, _ message: String) {
+        DispatchQueue.main.async {
+            self.lastThrottleResult[pid] = message
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                if self.lastThrottleResult[pid] == message {
+                    self.lastThrottleResult[pid] = nil
                 }
             }
         }
