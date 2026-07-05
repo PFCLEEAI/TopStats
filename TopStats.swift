@@ -26,6 +26,45 @@ struct ProcessConsumer: Identifiable, Hashable {
     }
 }
 
+// MARK: - Coding Agents Model
+//
+// `CodingAgentProcess` is intentionally a NEW, independent model — NOT an
+// extension of `ProcessConsumer`/`ConsumerRow` above. Those aggregate top
+// consumers by process NAME across every PID sharing that name and carry no
+// PID, kill, or working-directory field; none of that can be retrofitted
+// onto them without breaking every other row type (Top CPU/Memory/GPU-client
+// lists) that already depends on `ProcessConsumer`'s per-name-aggregate
+// shape. The existing "Top CPU Consumers" list keeps aggregating by name
+// across PIDs exactly as it does today — this type never touches it.
+struct CodingAgentProcess: Identifiable, Hashable {
+    let pid: Int32
+    let binaryName: String
+    let cpuPercent: Double
+    let rssMB: Double
+    let etimeSeconds: Int
+    let cwd: CwdResolution
+    /// v1 heuristic computed once per snapshot (see
+    /// `SystemStats.updateCodingAgentsOnQueue`): no controlling tty +
+    /// near-zero CPU + running over an hour. Detects orphaned/no-tty
+    /// processes ONLY — not a hung sub-agent still parented to a live
+    /// session. This field is added beyond the contract's literal struct
+    /// listing because Sprint 4's zombie badge and this sprint's own live
+    /// false-positive audit both need it attached per-process rather than
+    /// recomputed ad hoc by callers.
+    let isZombie: Bool
+
+    var id: Int32 { pid }
+}
+
+/// Honest working-directory resolution for a `CodingAgentProcess`. Never
+/// fabricated: a failed/timed-out/denied lookup must read as unknown/denied
+/// in the UI, never as a blank or guessed path.
+enum CwdResolution: Hashable {
+    case resolved(String)
+    case unknown
+    case permissionDenied
+}
+
 private struct ProcessSnapshot {
     let pid: Int
     let name: String
@@ -62,6 +101,11 @@ final class AppSettings: ObservableObject {
     @Published var showNetwork: Bool = false
     @Published var ramShowFree: Bool = false
     @Published var launchAtLogin: Bool = true
+    // Notched built-in displays only expose ~770pt of menu bar space to the right
+    // of the camera housing, shared with every system + third-party icon. Compact
+    // mode drops labels/padding so TopStats needs far less of that budget and is
+    // less likely to be the item macOS drops when the bar is crowded.
+    @Published var compactMenuBar: Bool = true
 
     init() {
         loadSettings()
@@ -77,6 +121,7 @@ final class AppSettings: ObservableObject {
         showNetwork = defaults.object(forKey: "showNetwork") as? Bool ?? false
         ramShowFree = defaults.object(forKey: "ramShowFree") as? Bool ?? false
         launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? true
+        compactMenuBar = defaults.object(forKey: "compactMenuBar") as? Bool ?? true
     }
 
     func saveSettings() {
@@ -88,6 +133,7 @@ final class AppSettings: ObservableObject {
         defaults.set(showNetwork, forKey: "showNetwork")
         defaults.set(ramShowFree, forKey: "ramShowFree")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
+        defaults.set(compactMenuBar, forKey: "compactMenuBar")
         LoginItemManager.setEnabled(launchAtLogin)
     }
 }
@@ -210,6 +256,7 @@ final class SystemStats: ObservableObject {
     @Published var lastUpdated: Date = Date()
     @Published var isFreeingMemory = false
     @Published var lastFreeUpResult: String?
+    @Published var codingAgentProcesses: [CodingAgentProcess] = []
 
     /// Invoked on the main queue after every sample tick; the menu-bar title
     /// refresh piggybacks on this instead of running its own 5 s timer.
@@ -235,8 +282,48 @@ final class SystemStats: ObservableObject {
     /// purge immediately (that one reclaims the launch-time churn). On `workQueue`.
     private var lastMallocRelief = Date.distantPast
 
+    /// Coding Agents sub-toggle visibility; read/written only on `workQueue`,
+    /// same pattern as `menuIsOpen`. This does NOT add a new timer — it only
+    /// adds a second gate on top of the existing 10 s `lastProcessSample`
+    /// cadence that already drives `updateProcessConsumers()`.
+    private var codingAgentsTabVisible = false
+    /// Resolved cwd cache, keyed by "pid:lstart" so a reused PID never
+    /// inherits a stale path. Only *successful* lookups are stored here
+    /// permanently — timeouts/permission failures are deliberately never
+    /// cached so they retry on the next manual refresh / view-open instead
+    /// of sticking forever. workQueue-confined.
+    private var codingAgentCwdCache: [String: String] = [:]
+    /// (pid, lstart) pairs matched on the most recent ps tick, so the
+    /// separate/coarser lsof resolve pass knows which PIDs to look up
+    /// without re-parsing ps itself. workQueue-confined.
+    private var latestCodingAgentKeys: [(pid: Int32, lstart: String)] = []
+    /// TopStats's own PID plus its full ancestor chain up to PID 1, computed
+    /// once (a running process's ancestry doesn't change) so a self/ancestor
+    /// row can never be constructed by the matching step below.
+    /// workQueue-confined (first touched from `sampleBody`, always on `workQueue`).
+    private lazy var codingAgentSelfExclusionSet: Set<Int32> = computeSelfAndAncestorPIDs()
+
     private static let appBundleRegex = try? NSRegularExpression(pattern: #"/([^/]+)\.app/"#)
     private static let gpuClientPIDRegex = try? NSRegularExpression(pattern: #"pid [0-9]+"#)
+    /// Matching rule (a): top-level CLI agents match ONLY these exact
+    /// basenames. background-throttle.sh's PATTERNS list was verified to
+    /// also include non-agent iCloud daemons (bird/cloudd) — deliberately
+    /// NOT reused here.
+    private static let cliAgentBasenames: Set<String> = ["claude", "claude.exe", "codex", "cursor-agent"]
+    /// Electron/Sparkle child markers: a CLI-basename match riding inside one
+    /// of these is a GUI helper process, not a top-level agent.
+    private static let electronChildMarkers = ["Helper (Renderer)", "Helper (GPU)", "Helper (Plugin)", "crashpad_handler", "Squirrel"]
+    /// Matching rule (b): MCP/Playwright children match by FULL COMMAND LINE
+    /// substring only — this intentionally never matches bare `node` by name.
+    private static let mcpCommandMarkers = ["modelcontextprotocol/server", "g-search-mcp", "@upstash/context7-mcp", "chrome-headless-shell"]
+    /// Live-verified on this machine (see _pm/work-log.md): denied-owner
+    /// `lsof -d cwd` lookups produce NO distinguishing stderr text and exit
+    /// 1 — identical to "no such fd/PID". Since the two are indistinguishable
+    /// here, this stays hardcoded false and every non-zero lsof exit resolves
+    /// to `.unknown` ("folder unknown"), never `.permissionDenied` — the
+    /// always-safe fallback copy the contract calls for when the exact
+    /// "Permission denied" signature can't be confirmed on this macOS version.
+    private static let lsofPermissionDeniedConfirmed = false
 
     /// `mach_host_self()` returns a send right whose uref count grows on every
     /// call (and can overflow after days of 5 s ticks); fetch it once and reuse.
@@ -286,6 +373,33 @@ final class SystemStats: ObservableObject {
         workQueue.async { self.menuIsOpen = false }
     }
 
+    /// Coding Agents sub-toggle switched on while the dashboard is open
+    /// (Sprint 4 wires this to the segmented-control selection). Marks the
+    /// section visible so the next 10 s ps ticks include coding-agent
+    /// sampling, and immediately resolves cwds for whatever is already
+    /// matched — this call is itself the "first-open" cwd-resolution trigger.
+    func codingAgentsTabWillAppear() {
+        workQueue.async {
+            self.codingAgentsTabVisible = true
+            self.updateCodingAgentsOnQueue()
+            self.resolveCodingAgentCwdsOnQueue()
+        }
+    }
+
+    /// Coding Agents sub-toggle switched away from, or dashboard closed.
+    func codingAgentsTabDidDisappear() {
+        workQueue.async { self.codingAgentsTabVisible = false }
+    }
+
+    /// Manual refresh action (Sprint 4). Re-samples ps immediately and
+    /// re-resolves cwds for anything not already cached.
+    func refreshCodingAgents() {
+        workQueue.async {
+            self.updateCodingAgentsOnQueue()
+            self.resolveCodingAgentCwdsOnQueue()
+        }
+    }
+
     private func sample(forceHeavy: Bool) {
         workQueue.async {
             self.sampleOnQueue(forceHeavy: forceHeavy)
@@ -319,6 +433,12 @@ final class SystemStats: ObservableObject {
         if forceHeavy || menuIsOpen {
             if forceHeavy || now.timeIntervalSince(lastProcessSample) >= 10 {
                 updateProcessConsumers()
+                // Coding Agents ps-based fields ride this SAME 10 s cadence
+                // (no new timer); the extra `codingAgentsTabVisible` gate is
+                // the only thing deciding whether this actually does work.
+                if codingAgentsTabVisible {
+                    updateCodingAgentsOnQueue()
+                }
                 lastProcessSample = now
             }
 
@@ -684,6 +804,270 @@ final class SystemStats: ObservableObject {
             self.topCPUConsumers = Array(cpu)
             self.topMemoryConsumers = Array(memory)
         }
+    }
+
+    // MARK: Coding Agents Engine (Sprint 1 — process-enumeration-engine)
+
+    private func computeSelfAndAncestorPIDs() -> Set<Int32> {
+        var result: Set<Int32> = [ProcessInfo.processInfo.processIdentifier]
+        var current = ProcessInfo.processInfo.processIdentifier
+        var hops = 0
+        while current > 1, hops < 4096 {
+            guard let raw = runCommand("/bin/ps", ["-o", "ppid=", "-p", "\(current)"]) else { break }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let ppid = Int32(trimmed), ppid > 0 else { break }
+            result.insert(ppid)
+            if ppid == 1 { break }
+            current = ppid
+            hops += 1
+        }
+        return result
+    }
+
+    /// Runs only while `codingAgentsTabVisible`, and only on the existing
+    /// 10 s `lastProcessSample` cadence already gated on `menuIsOpen` (see
+    /// `sampleBody`) — no new timer. Two `ps` calls rather than one:
+    /// `lstart` and `args` are both variable-width fields that would clobber
+    /// each other if crammed into one non-last column, so each gets its own
+    /// call with itself as the final (unsplit) column.
+    private func updateCodingAgentsOnQueue() {
+        guard let dataOutput = runCommand("/bin/ps", ["-axo", "pid=,tty=,pcpu=,rss=,etime=,lstart="]),
+              let argsOutput = runCommand("/bin/ps", ["-axo", "pid=,args="]) else {
+            return
+        }
+
+        var argsByPID: [Int32: String] = [:]
+        for line in argsOutput.split(separator: "\n", omittingEmptySubsequences: true) {
+            let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            guard parts.count == 2, let pid = Int32(parts[0]) else { continue }
+            argsByPID[pid] = String(parts[1])
+        }
+
+        // Hard rule: exclude TopStats's own PID and its full ancestor chain
+        // BEFORE any match/filter step below, so a self/ancestor row can
+        // never be constructed in the first place (reinforced again in
+        // Sprint 4's UI layer as a second, independent check).
+        let excluded = codingAgentSelfExclusionSet
+
+        var results: [CodingAgentProcess] = []
+        var keys: [(pid: Int32, lstart: String)] = []
+
+        for line in dataOutput.split(separator: "\n", omittingEmptySubsequences: true) {
+            let tokens = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard tokens.count >= 6,
+                  let pid = Int32(tokens[0]),
+                  !excluded.contains(pid),
+                  let cpu = Double(tokens[2]),
+                  let rssKB = Double(tokens[3]) else { continue }
+
+            // One PID's bad/missing args row must never blank/abort the rest
+            // of the list — just skip this PID and keep going.
+            guard let args = argsByPID[pid],
+                  let binaryName = matchCodingAgentBinaryName(args: args) else { continue }
+
+            let tty = String(tokens[1])
+            let etimeSeconds = parseEtimeSeconds(String(tokens[4]))
+            let lstart = tokens[5...].joined(separator: " ")
+
+            let cacheKey = cwdCacheKey(pid: pid, lstart: lstart)
+            let cwd: CwdResolution = codingAgentCwdCache[cacheKey].map { .resolved($0) } ?? .unknown
+
+            // Zombie flag v1 (see `CodingAgentProcess.isZombie` doc comment):
+            // no controlling tty + near-zero CPU + running over an hour,
+            // computed only for these already-matched CLI/MCP rows. Narrowed
+            // to drop a PPID==1 check after live data showed Codex.app's own
+            // backend process sits at PPID==1 permanently as normal GUI
+            // reparenting, not as a zombie signal — see _pm/work-log.md.
+            let isZombie = tty == "??" && cpu < 0.5 && etimeSeconds > 3600
+
+            results.append(CodingAgentProcess(
+                pid: pid,
+                binaryName: binaryName,
+                cpuPercent: cpu,
+                rssMB: rssKB / 1024,
+                etimeSeconds: etimeSeconds,
+                cwd: cwd,
+                isZombie: isZombie
+            ))
+            keys.append((pid: pid, lstart: lstart))
+        }
+
+        latestCodingAgentKeys = keys
+
+        DispatchQueue.main.async {
+            self.codingAgentProcesses = results
+        }
+    }
+
+    /// Rule (a): top-level CLI agents match ONLY an exact basename in the
+    /// allowed set, where the resolved executable path does not run through
+    /// a GUI app bundle's `Contents/MacOS/` and the command line carries no
+    /// Electron/Sparkle child markers — GUI wrapper apps are out of scope.
+    /// Rule (b): MCP/Playwright children match by FULL COMMAND LINE
+    /// substring only — this never matches bare `node` by name alone.
+    private func matchCodingAgentBinaryName(args: String) -> String? {
+        let firstToken = args.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+            .first.map(String.init) ?? ""
+        let basename = URL(fileURLWithPath: firstToken).lastPathComponent
+
+        if Self.cliAgentBasenames.contains(basename) {
+            if firstToken.contains("/Contents/MacOS/") { return nil }
+            for marker in Self.electronChildMarkers where args.contains(marker) {
+                return nil
+            }
+            return basename
+        }
+
+        for marker in Self.mcpCommandMarkers where args.contains(marker) {
+            return basename.isEmpty ? "node" : basename
+        }
+        return nil
+    }
+
+    /// Parses BSD `ps -o etime=` (`[[dd-]hh:]mm:ss`) into whole seconds.
+    private func parseEtimeSeconds(_ etime: String) -> Int {
+        var remainder = etime
+        var days = 0
+        if let dashIndex = etime.firstIndex(of: "-") {
+            days = Int(etime[etime.startIndex..<dashIndex]) ?? 0
+            remainder = String(etime[etime.index(after: dashIndex)...])
+        }
+        let parts = remainder.split(separator: ":").compactMap { Int($0) }
+        var seconds = 0
+        switch parts.count {
+        case 3: seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        case 2: seconds = parts[0] * 60 + parts[1]
+        case 1: seconds = parts[0]
+        default: seconds = 0
+        }
+        return days * 86400 + seconds
+    }
+
+    private func cwdCacheKey(pid: Int32, lstart: String) -> String {
+        "\(pid):\(lstart)"
+    }
+
+    /// Coarser than the ps sampling above: one `lsof -a -p <pid> -d cwd`
+    /// call per already-matched PID, never batched/unscoped, each under its
+    /// own 2 s timeout. Runs only from `codingAgentsTabWillAppear()` /
+    /// `refreshCodingAgents()` — NEVER from the 10 s ps tick.
+    private func resolveCodingAgentCwdsOnQueue() {
+        let keys = latestCodingAgentKeys
+        guard !keys.isEmpty else { return }
+
+        var resolvedByPID: [Int32: CwdResolution] = [:]
+        for entry in keys {
+            let key = cwdCacheKey(pid: entry.pid, lstart: entry.lstart)
+            if let cachedPath = codingAgentCwdCache[key] {
+                // Already-cached PIDs are never re-queried on reopen.
+                resolvedByPID[entry.pid] = .resolved(cachedPath)
+                continue
+            }
+
+            // One PID's lsof failure must never blank/abort the rest of the list.
+            let result = resolveCwd(forPID: entry.pid)
+            if case .resolved(let path) = result {
+                codingAgentCwdCache[key] = path
+            }
+            // Deliberately NOT caching .unknown/.permissionDenied: a failed
+            // lookup must retry on the next manual refresh, not stick forever.
+            resolvedByPID[entry.pid] = result
+        }
+
+        DispatchQueue.main.async {
+            self.codingAgentProcesses = self.codingAgentProcesses.map { process in
+                guard let newCwd = resolvedByPID[process.pid] else { return process }
+                return CodingAgentProcess(
+                    pid: process.pid,
+                    binaryName: process.binaryName,
+                    cpuPercent: process.cpuPercent,
+                    rssMB: process.rssMB,
+                    etimeSeconds: process.etimeSeconds,
+                    cwd: newCwd,
+                    isZombie: process.isZombie
+                )
+            }
+        }
+    }
+
+    private func resolveCwd(forPID pid: Int32) -> CwdResolution {
+        let result = runCommandWithTimeout("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"], timeout: 2.0)
+
+        if result.timedOut {
+            // A timeout resolves to .unknown, never .permissionDenied —
+            // retried only on the next manual refresh (see caching note above).
+            return .unknown
+        }
+
+        if result.exitCode == 0 {
+            for line in result.stdout.split(separator: "\n") {
+                if line.hasPrefix("n") {
+                    let path = String(line.dropFirst())
+                    if !path.isEmpty { return .resolved(path) }
+                }
+            }
+            return .unknown
+        }
+
+        if Self.lsofPermissionDeniedConfirmed, result.stderr.localizedCaseInsensitiveContains("Permission denied") {
+            return .permissionDenied
+        }
+        return .unknown
+    }
+
+    /// `runCommand` has no timeout; this variant exists only for the coarser
+    /// per-PID lsof cwd lookup above, which is explicitly required to be
+    /// bounded. Note: the process this can `terminate()` on timeout is the
+    /// `lsof` HELPER SUBPROCESS THIS FUNCTION ITSELF SPAWNED a few lines
+    /// above — never a claude/codex/cursor-agent/MCP process being inspected.
+    private func runCommandWithTimeout(
+        _ launchPath: String,
+        _ arguments: [String],
+        timeout: TimeInterval
+    ) -> (stdout: String, stderr: String, exitCode: Int32, timedOut: Bool) {
+        let process = Process()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in semaphore.signal() }
+
+        do {
+            try process.run()
+        } catch {
+            return ("", "", -1, false)
+        }
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            // Terminates only the `lsof` child handle created above — never
+            // any other PID on the system.
+            process.terminate()
+            _ = semaphore.wait(timeout: .now() + 0.3)
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            return (
+                String(data: outData, encoding: .utf8) ?? "",
+                String(data: errData, encoding: .utf8) ?? "",
+                -1,
+                true
+            )
+        }
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        return (
+            String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "",
+            process.terminationStatus,
+            false
+        )
     }
 
     private func updateGPUClients() {
@@ -1356,6 +1740,12 @@ struct SettingsView: View {
                     Toggle("GPU", isOn: $settings.showGPU)
                     Toggle("Temperature", isOn: $settings.showTemp)
                     Toggle("Network", isOn: $settings.showNetwork)
+                    Divider()
+                    Toggle("Compact width", isOn: $settings.compactMenuBar)
+                    Text("Drops labels so the title takes less menu bar space — recommended on notched displays, where it competes with every other icon for a fixed-width strip beside the camera housing.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.top, 4)
             }
@@ -1387,7 +1777,7 @@ struct SettingsView: View {
             }
         }
         .padding(18)
-        .frame(width: 320, height: 430)
+        .frame(width: 320, height: 480)
     }
 }
 
@@ -1465,6 +1855,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func observeCommands() {
         NotificationCenter.default.addObserver(self, selector: #selector(openSettings), name: .topStatsOpenSettings, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(quitApp), name: .topStatsQuit, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screenParametersChanged), name: NSWorkspace.didWakeNotification, object: nil)
+    }
+
+    // On multi-display setups (especially with a mirrored primary display alongside
+    // extended secondaries), WindowServer/Dock can leave the status item out of the
+    // recomposited menu bar on one screen after a docking, sleep/wake, or arrangement
+    // change. Toggling isVisible forces a redraw across every screen's menu bar
+    // without losing the autosaved position. A short delay lets the new display
+    // arrangement settle before the nudge.
+    @objc private func screenParametersChanged() {
+        guard let item = statusItem else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            item.isVisible = false
+            item.isVisible = true
+        }
     }
 
     private func configureStatusItem() {
@@ -1551,19 +1957,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func menuBarTitle() -> String {
         var parts: [String] = []
+        let compact = settings.compactMenuBar
 
         if settings.showCPU {
-            parts.append(String(format: "CPU %.0f%%", stats.cpuUsage))
+            parts.append(compact ? String(format: "%.0f%%", stats.cpuUsage) : String(format: "CPU %.0f%%", stats.cpuUsage))
         }
 
         if settings.showRAM {
-            let label = settings.ramShowFree ? "RAM A" : "RAM U"
             let value = settings.ramShowFree ? stats.ramFree : stats.ramUsed
-            parts.append(String(format: "%@ %.1fG", label, value))
+            if compact {
+                parts.append(String(format: "%.0fG", value))
+            } else {
+                let label = settings.ramShowFree ? "RAM A" : "RAM U"
+                parts.append(String(format: "%@ %.1fG", label, value))
+            }
         }
 
         if settings.showGPU {
-            parts.append(String(format: "GPU %.0f%%", stats.gpuUsage))
+            parts.append(compact ? String(format: "%.0f%%", stats.gpuUsage) : String(format: "GPU %.0f%%", stats.gpuUsage))
         }
 
         if settings.showTemp {
@@ -1574,7 +1985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             parts.append("D\(formatBitsPerSecond(stats.downloadSpeed, compact: true)) U\(formatBitsPerSecond(stats.uploadSpeed, compact: true))")
         }
 
-        return parts.isEmpty ? "TopStats" : parts.joined(separator: "  ")
+        return parts.isEmpty ? "TopStats" : parts.joined(separator: compact ? " " : "  ")
     }
 
     private func menuBarTooltip() -> String {
