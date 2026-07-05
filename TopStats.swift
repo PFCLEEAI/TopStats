@@ -2272,13 +2272,15 @@ struct ConsumerRow: View {
 
 // MARK: - Coding Agents UI (Sprint 4 — coding-agents-ui-section)
 
-/// Payload for the Kill confirmation flow. The dashboard is an
-/// `NSHostingView` inside an `NSMenuItem` inside `statusItem.menu` — SwiftUI
-/// `.alert`/`.confirmationDialog` is fragile under NSMenu's modal tracking
-/// loop, so Kill routes through a plain `Notification` to `AppDelegate`,
-/// which cancels menu tracking and presents a standalone app-modal `NSAlert`
-/// on the next run-loop tick (see `AppDelegate.handleKillConfirmationRequest`).
-struct KillConfirmationRequest {
+/// Pending Kill confirmation, held as row-local `@State`. Rendered as an
+/// inline in-menu card (not a system `NSAlert`) — an `NSAlert`/SwiftUI
+/// `.alert` would require `cancelTracking()` on `statusItem.menu`, which
+/// closes the whole dashboard just to show the confirmation. Plain SwiftUI
+/// state-driven view swaps work fine inside this `NSHostingView` (the rest
+/// of the dashboard already proves that); only *system-presented* modals are
+/// unreliable here — so the confirmation stays inline and the dashboard
+/// never closes for it.
+struct PendingKillConfirmation {
     let pid: Int32
     let binaryName: String
     let expectedStartTime: TimeInterval
@@ -2290,10 +2292,6 @@ struct KillConfirmationRequest {
     let cwdUnresolved: Bool
     let childCount: Int
     let isZombie: Bool
-}
-
-extension Notification.Name {
-    static let topStatsRequestKillConfirmation = Notification.Name("TopStatsRequestKillConfirmation")
 }
 
 /// New section behind the CPU tab's Coding Agents sub-toggle, bound to
@@ -2392,8 +2390,28 @@ struct CodingAgentsSection: View {
 struct CodingAgentRow: View {
     let process: CodingAgentProcess
     @ObservedObject var stats: SystemStats
+    @State private var pendingKill: PendingKillConfirmation?
 
     var body: some View {
+        Group {
+            if let pending = pendingKill {
+                killConfirmationContent(pending)
+            } else {
+                normalContent
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(pendingKill == nil ? Color.white.opacity(0.045) : Palette.red.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(pendingKill == nil ? Color.white.opacity(0.06) : Palette.red.opacity(0.45), lineWidth: 1)
+                )
+        )
+    }
+
+    private var normalContent: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
@@ -2437,15 +2455,81 @@ struct CodingAgentRow: View {
                     .foregroundColor(Palette.cyan)
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.045))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
-                )
+    }
+
+    /// Inline Kill confirmation — replaces this row's normal content in
+    /// place, without touching `statusItem.menu` at all, so the dashboard
+    /// stays open the entire time. Same dialog copy/logic as the old
+    /// `NSAlert` (see `killConfirmationCopy`), just rendered as ordinary
+    /// SwiftUI state instead of a system modal.
+    private func killConfirmationContent(_ pending: PendingKillConfirmation) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(Palette.yellow)
+                Text("Kill \(pending.binaryName) (PID \(pending.pid))?")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .lineLimit(2)
+            }
+            Text(killConfirmationCopy(pending))
+                .font(.system(size: 10.5))
+                .foregroundColor(Palette.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Spacer()
+                Button {
+                    pendingKill = nil
+                } label: {
+                    Text("Cancel")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundColor(Palette.text)
+                        .padding(.horizontal, 12)
+                        .frame(height: 24)
+                        .background(Capsule().fill(Color.white.opacity(0.10)))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    confirmKill(pending)
+                } label: {
+                    Text(pending.cwdUnresolved ? "Kill Anyway" : "Kill")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundColor(Palette.ink)
+                        .padding(.horizontal, 12)
+                        .frame(height: 24)
+                        .background(Capsule().fill(Palette.red))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    /// Dialog copy assembled inside-out: base sentence + always-on
+    /// SIGTERM/SIGKILL explainer, then the unresolved-cwd prepend, then the
+    /// not-idle prepend outermost — matches the retired `NSAlert` version.
+    private func killConfirmationCopy(_ pending: PendingKillConfirmation) -> String {
+        var informative = "Running from: \(pending.cwdDescription)"
+        if pending.childCount > 0 {
+            informative += " This process has \(pending.childCount) child process(es) that will not be stopped by this action."
+        }
+        informative += " This sends a termination signal (SIGTERM) first; if the process does not stop within 3 seconds, this app will force-stop it (SIGKILL)."
+        if pending.cwdUnresolved {
+            informative = "Folder could not be verified for this process. " + informative
+        }
+        if !pending.isZombie {
+            informative = "This does not look idle — it may be an active session. " + informative
+        }
+        return informative
+    }
+
+    private func confirmKill(_ pending: PendingKillConfirmation) {
+        stats.killAgentProcess(
+            pid: pending.pid,
+            expectedBinaryName: pending.binaryName,
+            expectedStartTime: pending.expectedStartTime
         )
+        pendingKill = nil
     }
 
     /// Small pill, "Idle 1h+" (never "Zombie") — positioned left/name side,
@@ -2498,10 +2582,9 @@ struct CodingAgentRow: View {
         }
     }
 
-    /// Computes the live child count BEFORE presenting the dialog (per
-    /// `SystemStats.liveChildCount`'s doc comment), then hands off to
-    /// `AppDelegate` via notification — never presents a SwiftUI
-    /// `.alert`/`.confirmationDialog` directly from inside the menu-hosted view.
+    /// Computes the live child count BEFORE showing the confirmation (per
+    /// `SystemStats.liveChildCount`'s doc comment), then sets `pendingKill`
+    /// directly — the dashboard menu is never touched, so it stays open.
     private func requestKillConfirmation() {
         guard let startTime = process.startTime else { return }
         let pid = process.pid
@@ -2512,7 +2595,7 @@ struct CodingAgentRow: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             let childCount = stats.liveChildCount(ofPID: pid)
-            let request = KillConfirmationRequest(
+            let pending = PendingKillConfirmation(
                 pid: pid,
                 binaryName: binaryName,
                 expectedStartTime: startTime,
@@ -2522,7 +2605,7 @@ struct CodingAgentRow: View {
                 isZombie: isZombie
             )
             DispatchQueue.main.async {
-                NotificationCenter.default.post(name: .topStatsRequestKillConfirmation, object: request)
+                pendingKill = pending
             }
         }
     }
@@ -2615,43 +2698,53 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(spacing: 0) {
             Text("TopStats Settings")
                 .font(.system(size: 18, weight: .bold, design: .rounded))
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 14)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 10)
 
-            SettingsSection(icon: "menubar.rectangle", title: "MENU BAR", accent: Palette.cyan) {
-                VStack(alignment: .leading, spacing: 9) {
-                    Toggle("CPU", isOn: $settings.showCPU)
-                    Toggle("Memory", isOn: $settings.showRAM)
-                    Toggle("GPU", isOn: $settings.showGPU)
-                    Toggle("Temperature", isOn: $settings.showTemp)
-                    Toggle("Network", isOn: $settings.showNetwork)
-                    Divider().overlay(Palette.border)
-                    Toggle("Compact width", isOn: $settings.compactMenuBar)
-                    Text("Drops labels so the title takes less menu bar space — recommended on notched displays, where it competes with every other icon for a fixed-width strip beside the camera housing.")
-                        .font(.system(size: 11))
-                        .foregroundColor(Palette.muted)
-                        .fixedSize(horizontal: false, vertical: true)
+            // Scrolling body — the fixed-height title/Save chrome never
+            // moves, and content can never overflow past the window's
+            // bottom edge even if a future toggle/section is added.
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 14) {
+                    SettingsSection(icon: "menubar.rectangle", title: "MENU BAR", accent: Palette.cyan) {
+                        VStack(alignment: .leading, spacing: 9) {
+                            Toggle("CPU", isOn: $settings.showCPU)
+                            Toggle("Memory", isOn: $settings.showRAM)
+                            Toggle("GPU", isOn: $settings.showGPU)
+                            Toggle("Temperature", isOn: $settings.showTemp)
+                            Toggle("Network", isOn: $settings.showNetwork)
+                            Divider().overlay(Palette.border)
+                            Toggle("Compact width", isOn: $settings.compactMenuBar)
+                            Text("Drops labels so the title takes less menu bar space — recommended on notched displays, where it competes with every other icon for a fixed-width strip beside the camera housing.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Palette.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .tint(Palette.cyan)
+                    }
+
+                    SettingsSection(icon: "memorychip", title: "MEMORY", accent: Palette.blue) {
+                        Picker("", selection: $settings.ramShowFree) {
+                            Text("Used").tag(false)
+                            Text("Available").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
+
+                    SettingsSection(icon: "bolt.fill", title: "STARTUP", accent: Palette.purple) {
+                        Toggle("Launch at Login", isOn: $settings.launchAtLogin)
+                            .tint(Palette.purple)
+                    }
                 }
-                .tint(Palette.cyan)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 12)
             }
-
-            SettingsSection(icon: "memorychip", title: "MEMORY", accent: Palette.blue) {
-                Picker("", selection: $settings.ramShowFree) {
-                    Text("Used").tag(false)
-                    Text("Available").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-            }
-
-            SettingsSection(icon: "bolt.fill", title: "STARTUP", accent: Palette.purple) {
-                Toggle("Launch at Login", isOn: $settings.launchAtLogin)
-                    .tint(Palette.purple)
-            }
-
-            Spacer(minLength: 0)
 
             HStack {
                 Spacer()
@@ -2669,9 +2762,9 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
                 .keyboardShortcut(.defaultAction)
             }
+            .padding(18)
         }
-        .padding(18)
-        .frame(width: 340, height: 520)
+        .frame(width: 340, height: 560)
         .background(Palette.ink)
         .foregroundColor(Palette.text)
     }
@@ -2753,67 +2846,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(quitApp), name: .topStatsQuit, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screenParametersChanged), name: NSWorkspace.didWakeNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(handleKillConfirmationRequest(_:)), name: .topStatsRequestKillConfirmation, object: nil)
-    }
-
-    // MARK: Coding Agents — Kill confirmation (Sprint 4)
-
-    /// The dashboard is an `NSHostingView` inside an `NSMenuItem` inside
-    /// `statusItem.menu` — SwiftUI's `.alert`/`.confirmationDialog` is
-    /// fragile under NSMenu's modal tracking loop. Concretely: (1) cancel the
-    /// menu's tracking loop, (2) on the next run-loop tick present a
-    /// standalone, app-modal `NSAlert` via `.runModal()` — independent of
-    /// menu tracking — (3) proceed to `killAgentProcess` only on confirm.
-    @objc private func handleKillConfirmationRequest(_ notification: Notification) {
-        guard let request = notification.object as? KillConfirmationRequest else { return }
-        statusItem?.menu?.cancelTracking()
-        DispatchQueue.main.async { [weak self] in
-            self?.presentKillConfirmation(request)
-        }
-    }
-
-    private func presentKillConfirmation(_ request: KillConfirmationRequest) {
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Kill \(request.binaryName) (PID \(request.pid))?"
-
-        // Dialog copy is assembled inside-out: base sentence + always-on
-        // SIGTERM/SIGKILL explainer, then the unresolved-cwd prepend, then
-        // the not-idle prepend outermost — see contract Sprint 4 "Dialog copy".
-        var informative = "Running from: \(request.cwdDescription)"
-        if request.childCount > 0 {
-            informative += " This process has \(request.childCount) child process(es) that will not be stopped by this action."
-        }
-        informative += " This sends a termination signal (SIGTERM) first; if the process does not stop within 3 seconds, this app will force-stop it (SIGKILL)."
-        if request.cwdUnresolved {
-            informative = "Folder could not be verified for this process. " + informative
-        }
-        if !request.isZombie {
-            informative = "This does not look idle — it may be an active session. " + informative
-        }
-        alert.informativeText = informative
-
-        // Cancel is first/default (Return key); Kill/Kill Anyway is second,
-        // non-default, red-styled — explicit keyEquivalents so this holds
-        // regardless of NSAlert's own title-based defaulting behavior.
-        let cancelButton = alert.addButton(withTitle: "Cancel")
-        cancelButton.keyEquivalent = "\r"
-        let killTitle = request.cwdUnresolved ? "Kill Anyway" : "Kill"
-        let killButton = alert.addButton(withTitle: killTitle)
-        killButton.keyEquivalent = ""
-        if #available(macOS 11.0, *) {
-            killButton.hasDestructiveAction = true
-        }
-
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        if response == .alertSecondButtonReturn {
-            stats.killAgentProcess(
-                pid: request.pid,
-                expectedBinaryName: request.binaryName,
-                expectedStartTime: request.expectedStartTime
-            )
-        }
     }
 
     // On multi-display setups (especially with a mirrored primary display alongside
@@ -2874,7 +2906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settingsWindow == nil {
             let settingsView = SettingsView(settings: settings)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 340, height: 520),
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 560),
                 styleMask: [.titled, .closable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
