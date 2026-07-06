@@ -122,6 +122,7 @@ final class AppSettings: ObservableObject {
     @Published var showTemp: Bool = true
     @Published var showNetwork: Bool = false
     @Published var ramShowFree: Bool = false
+    @Published var useFahrenheit: Bool = false
     @Published var launchAtLogin: Bool = true
     // Notched built-in displays only expose ~770pt of menu bar space to the right
     // of the camera housing, shared with every system + third-party icon. Compact
@@ -142,6 +143,7 @@ final class AppSettings: ObservableObject {
         // Network is opt-in: it belongs in the dashboard, not permanently in the menu bar.
         showNetwork = defaults.object(forKey: "showNetwork") as? Bool ?? false
         ramShowFree = defaults.object(forKey: "ramShowFree") as? Bool ?? false
+        useFahrenheit = defaults.object(forKey: "useFahrenheit") as? Bool ?? false
         launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? true
         compactMenuBar = defaults.object(forKey: "compactMenuBar") as? Bool ?? true
     }
@@ -154,6 +156,7 @@ final class AppSettings: ObservableObject {
         defaults.set(showTemp, forKey: "showTemp")
         defaults.set(showNetwork, forKey: "showNetwork")
         defaults.set(ramShowFree, forKey: "ramShowFree")
+        defaults.set(useFahrenheit, forKey: "useFahrenheit")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
         defaults.set(compactMenuBar, forKey: "compactMenuBar")
         LoginItemManager.setEnabled(launchAtLogin)
@@ -266,8 +269,10 @@ final class SystemStats: ObservableObject {
     @Published var ramUsed: Double = 0
     @Published var ramTotal: Double = 0
     @Published var gpuUsage: Double = 0
-    @Published var temperature: String = "--C"
+    /// Always Celsius — gauge/color/icon thresholds are tuned in Celsius, and
+    /// `formatTemperature` converts to the user's chosen unit at display time.
     @Published var temperatureValue: Double = 0
+    @Published var temperatureIsEstimate: Bool = false
     @Published var downloadSpeed: Double = 0
     @Published var uploadSpeed: Double = 0
     @Published var topCPUConsumers: [ProcessConsumer] = []
@@ -512,8 +517,8 @@ final class SystemStats: ObservableObject {
                 if ram.free != self.ramFree { self.ramFree = ram.free; changed = true }
                 if ram.total != self.ramTotal { self.ramTotal = ram.total; changed = true }
             }
-            if temp.text != self.temperature { self.temperature = temp.text; changed = true }
             if temp.value != self.temperatureValue { self.temperatureValue = temp.value; changed = true }
+            if temp.isEstimate != self.temperatureIsEstimate { self.temperatureIsEstimate = temp.isEstimate; changed = true }
             if let net {
                 if net.down != self.downloadSpeed { self.downloadSpeed = net.down; changed = true }
                 if net.up != self.uploadSpeed { self.uploadSpeed = net.up; changed = true }
@@ -745,14 +750,14 @@ final class SystemStats: ObservableObject {
         return value.doubleValue
     }
 
-    private func readTemperature() -> (text: String, value: Double) {
+    private func readTemperature() -> (value: Double, isEstimate: Bool) {
         let tempFile = "/tmp/cpu_temp.txt"
         if let tempString = try? String(contentsOfFile: tempFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines),
            let temp = Double(tempString),
            temp > 0,
            temp < 150 {
-            return (String(format: "%.0fC", temp), temp)
+            return (temp, false)
         }
 
         let estimatedTemp: Double
@@ -769,7 +774,7 @@ final class SystemStats: ObservableObject {
             estimatedTemp = 50
         }
 
-        return (String(format: "~%.0fC", estimatedTemp), estimatedTemp)
+        return (estimatedTemp, true)
     }
 
     private func getNetworkBytes() -> (UInt64, UInt64) {
@@ -1728,6 +1733,16 @@ func formatBitsPerSecond(_ bytesPerSecond: Double, compact: Bool) -> String {
     return "\(number) \(unit)"
 }
 
+/// `celsius` is always the raw sensor/estimate value — conversion happens
+/// only at display time so `SystemStats.temperatureValue`'s gauge/color/icon
+/// threshold math (all tuned in Celsius) never has to care about the unit.
+func formatTemperature(celsius: Double, isEstimate: Bool, useFahrenheit: Bool) -> String {
+    let value = useFahrenheit ? celsius * 9 / 5 + 32 : celsius
+    let unit = useFahrenheit ? "F" : "C"
+    let prefix = isEstimate ? "~" : ""
+    return String(format: "\(prefix)%.0f\(unit)", value)
+}
+
 // MARK: - Views
 
 private enum Palette {
@@ -1820,7 +1835,7 @@ struct TopStatsDashboardView: View {
             MetricCard(
                 icon: tempIcon,
                 title: "Thermal",
-                value: stats.temperature,
+                value: formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit),
                 caption: thermalCaption,
                 accent: temperatureColor,
                 gaugeValue: (stats.temperatureValue - 30) / 70
@@ -2737,6 +2752,15 @@ struct SettingsView: View {
                         .labelsHidden()
                     }
 
+                    SettingsSection(icon: "thermometer", title: "TEMPERATURE", accent: Palette.yellow) {
+                        Picker("", selection: $settings.useFahrenheit) {
+                            Text("Celsius").tag(false)
+                            Text("Fahrenheit").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
+
                     SettingsSection(icon: "bolt.fill", title: "STARTUP", accent: Palette.purple) {
                         Toggle("Launch at Login", isOn: $settings.launchAtLogin)
                             .tint(Palette.purple)
@@ -2973,7 +2997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if settings.showTemp {
-            parts.append(stats.temperature)
+            parts.append(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))
         }
 
         if settings.showNetwork {
@@ -2991,7 +3015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             String(format: "RAM available estimate: %.1f GB", stats.ramFree),
             String(format: "GPU: %.0f%%", stats.gpuUsage),
             "GPU clients: \(stats.gpuClientCount)",
-            "Temperature: \(stats.temperature)",
+            "Temperature: \(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))",
             "Download: \(formatBitsPerSecond(stats.downloadSpeed, compact: false))",
             "Upload: \(formatBitsPerSecond(stats.uploadSpeed, compact: false))"
         ].joined(separator: "\n")
