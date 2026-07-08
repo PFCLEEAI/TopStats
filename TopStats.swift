@@ -2734,8 +2734,8 @@ struct SettingsView: View {
                             Toggle("Temperature", isOn: $settings.showTemp)
                             Toggle("Network", isOn: $settings.showNetwork)
                             Divider().overlay(Palette.border)
-                            Toggle("Compact width", isOn: $settings.compactMenuBar)
-                            Text("Drops labels so the title takes less menu bar space — recommended on notched displays, where it competes with every other icon for a fixed-width strip beside the camera housing.")
+                            Toggle("Auto fit width", isOn: $settings.compactMenuBar)
+                            Text("Auto-fits the title on laptop and notched displays. TopStats keeps labels when they fit, then uses shorter labels before compact fallback.")
                                 .font(.system(size: 11))
                                 .foregroundColor(Palette.muted)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -2837,6 +2837,11 @@ extension Notification.Name {
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct MenuBarRender {
+        let title: String
+        let fontSize: CGFloat
+    }
+
     private var settingsWindow: NSWindow?
     private let stats = SystemStats()
     private let settings = AppSettings()
@@ -2844,8 +2849,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tempHelperProcess: Process?
     private var dashboardHost: NSHostingView<TopStatsDashboardView>?
     private var dashboardItem: NSMenuItem?
+    private var menuBarOverlayWindow: NSPanel?
+    private var menuBarOverlayButton: NSButton?
     private var lastTitle = ""
     private var lastTooltip = ""
+    private var lastOverlayTitle = ""
+    private var lastTitleFontSize: CGFloat = 12
+    private var screenRefreshWorkItems: [DispatchWorkItem] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if settings.launchAtLogin {
@@ -2872,18 +2882,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screenParametersChanged), name: NSWorkspace.didWakeNotification, object: nil)
     }
 
-    // On multi-display setups (especially with a mirrored primary display alongside
-    // extended secondaries), WindowServer/Dock can leave the status item out of the
-    // recomposited menu bar on one screen after a docking, sleep/wake, or arrangement
-    // change. Toggling isVisible forces a redraw across every screen's menu bar
-    // without losing the autosaved position. A short delay lets the new display
-    // arrangement settle before the nudge.
+    // Display unplug/dock events can leave the old status item tied to stale menu
+    // bar geometry. Recreating it after the screen list settles gives macOS a fresh
+    // chance to place it, then later nudges visibility for the final recomposite.
     @objc private func screenParametersChanged() {
-        guard let item = statusItem else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            item.isVisible = false
-            item.isVisible = true
-        }
+        screenRefreshWorkItems.forEach { $0.cancel() }
+        screenRefreshWorkItems.removeAll()
+
+        scheduleScreenRefresh(after: 0.35, recreate: true)
+        scheduleScreenRefresh(after: 1.2, recreate: false)
     }
 
     private func configureStatusItem() {
@@ -2891,7 +2898,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.autosaveName = "TopStatsStatusItem"
 
         if let button = statusItem.button {
-            button.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+            button.font = menuBarFont(size: lastTitleFontSize)
             button.image = nil
             button.imagePosition = .noImage
             button.toolTip = "TopStats"
@@ -2962,7 +2969,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateMenuBarTitle() {
         guard let button = statusItem?.button else { return }
         // Skip redraws when the rendered strings have not changed.
-        let title = menuBarTitle()
+        let render = menuBarRender()
+        if render.fontSize != lastTitleFontSize {
+            lastTitleFontSize = render.fontSize
+            button.font = menuBarFont(size: render.fontSize)
+        }
+        let title = render.title
         if title != lastTitle {
             lastTitle = title
             button.title = title
@@ -2972,39 +2984,234 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastTooltip = tooltip
             button.toolTip = tooltip
         }
+        updateMenuBarOverlay(title: laptopOverlayTitle(), tooltip: tooltip)
     }
 
-    private func menuBarTitle() -> String {
+    private func scheduleScreenRefresh(after delay: TimeInterval, recreate: Bool) {
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if recreate {
+                self.recreateStatusItem()
+            } else {
+                self.reassertStatusItemVisibility()
+            }
+        }
+        screenRefreshWorkItems.append(workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func recreateStatusItem() {
+        if let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item)
+        }
+        dashboardHost = nil
+        dashboardItem = nil
+        lastTitle = ""
+        lastTooltip = ""
+        lastOverlayTitle = ""
+        lastTitleFontSize = 12
+        configureStatusItem()
+        updateMenuBarTitle()
+    }
+
+    private func reassertStatusItemVisibility() {
+        guard let item = statusItem else { return }
+        item.isVisible = false
+        item.isVisible = true
+        lastTitle = ""
+        lastTooltip = ""
+        lastOverlayTitle = ""
+        updateMenuBarTitle()
+    }
+
+    private func updateMenuBarOverlay(title: String, tooltip: String) {
+        guard let screen = NSScreen.screens.first(where: { $0.auxiliaryTopLeftArea != nil }),
+              let leftArea = screen.auxiliaryTopLeftArea else {
+            menuBarOverlayWindow?.orderOut(nil)
+            return
+        }
+
+        if menuBarOverlayWindow == nil {
+            let panel = NSPanel(
+                contentRect: .zero,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = false
+            panel.level = .statusBar
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            panel.hidesOnDeactivate = false
+
+            let button = NSButton(frame: .zero)
+            button.isBordered = false
+            button.bezelStyle = .regularSquare
+            button.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+            button.alignment = .center
+            button.lineBreakMode = .byTruncatingTail
+            button.target = self
+            button.action = #selector(menuBarOverlayClicked)
+            panel.contentView = button
+
+            menuBarOverlayWindow = panel
+            menuBarOverlayButton = button
+        }
+
+        let width = min(280, max(150, leftArea.width * 0.36))
+        let frame = NSRect(
+            x: leftArea.maxX - width - 8,
+            y: leftArea.minY,
+            width: width,
+            height: leftArea.height
+        )
+        menuBarOverlayWindow?.setFrame(frame, display: true)
+        menuBarOverlayButton?.frame = NSRect(origin: .zero, size: frame.size)
+        menuBarOverlayButton?.toolTip = tooltip
+
+        if title != lastOverlayTitle {
+            lastOverlayTitle = title
+            menuBarOverlayButton?.title = title
+        }
+
+        menuBarOverlayWindow?.orderFrontRegardless()
+    }
+
+    private func laptopOverlayTitle() -> String {
+        menuBarTitle(labels: true, roundedRAM: false, includeNetwork: false, separator: "  ")
+    }
+
+    @objc private func menuBarOverlayClicked() {
+        guard let button = menuBarOverlayButton, let menu = statusItem?.menu else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+    }
+
+    private func menuBarFont(size: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: size, weight: .medium)
+    }
+
+    private func menuBarRender() -> MenuBarRender {
+        let candidates = menuBarTitleCandidates()
+        let budget = menuBarTitleBudget()
+
+        for title in candidates {
+            for size in [12, 11, 10, 9, 8] as [CGFloat] {
+                if measuredMenuBarWidth(title, fontSize: size) <= budget {
+                    return MenuBarRender(title: title, fontSize: size)
+                }
+            }
+        }
+
+        return MenuBarRender(title: candidates.last ?? "TopStats", fontSize: 9)
+    }
+
+    private func menuBarTitleCandidates() -> [String] {
+        let showNetwork = settings.showNetwork
+        let full = menuBarTitle(labels: true, roundedRAM: false, includeNetwork: showNetwork, separator: "  ")
+        let fullTight = menuBarTitle(labels: true, roundedRAM: false, includeNetwork: showNetwork, separator: " ")
+        let fullRounded = menuBarTitle(labels: true, roundedRAM: true, includeNetwork: showNetwork, separator: " ")
+        let shortLabels = shortLabelMenuBarTitle(includeNetwork: showNetwork)
+        let compact = menuBarTitle(labels: false, roundedRAM: true, includeNetwork: showNetwork, separator: " ")
+
+        var candidates = [full, fullTight, fullRounded, shortLabels]
+        if settings.compactMenuBar {
+            candidates.append(compact)
+        }
+        if showNetwork {
+            candidates.append(menuBarTitle(labels: settings.compactMenuBar == false, roundedRAM: true, includeNetwork: false, separator: " "))
+            candidates.append(shortLabelMenuBarTitle(includeNetwork: false))
+        }
+        candidates.append(compact)
+        return candidates
+    }
+
+    private func shortLabelMenuBarTitle(includeNetwork: Bool) -> String {
         var parts: [String] = []
-        let compact = settings.compactMenuBar
 
         if settings.showCPU {
-            parts.append(compact ? String(format: "%.0f%%", stats.cpuUsage) : String(format: "CPU %.0f%%", stats.cpuUsage))
+            parts.append(String(format: "CPU%.0f%%", stats.cpuUsage))
         }
 
         if settings.showRAM {
             let value = settings.ramShowFree ? stats.ramFree : stats.ramUsed
-            if compact {
-                parts.append(String(format: "%.0fG", value))
-            } else {
-                let label = settings.ramShowFree ? "RAM A" : "RAM U"
-                parts.append(String(format: "%@ %.1fG", label, value))
-            }
+            parts.append(String(format: "RAM%.0fG", value))
         }
 
         if settings.showGPU {
-            parts.append(compact ? String(format: "%.0f%%", stats.gpuUsage) : String(format: "GPU %.0f%%", stats.gpuUsage))
+            parts.append(String(format: "GPU%.0f%%", stats.gpuUsage))
         }
 
         if settings.showTemp {
             parts.append(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))
         }
 
-        if settings.showNetwork {
+        if includeNetwork {
             parts.append("D\(formatBitsPerSecond(stats.downloadSpeed, compact: true)) U\(formatBitsPerSecond(stats.uploadSpeed, compact: true))")
         }
 
-        return parts.isEmpty ? "TopStats" : parts.joined(separator: compact ? " " : "  ")
+        return parts.isEmpty ? "TopStats" : parts.joined(separator: " ")
+    }
+
+    private func menuBarTitle(labels: Bool, roundedRAM: Bool, includeNetwork: Bool, separator: String) -> String {
+        var parts: [String] = []
+
+        if settings.showCPU {
+            parts.append(labels ? String(format: "CPU %.0f%%", stats.cpuUsage) : String(format: "%.0f%%", stats.cpuUsage))
+        }
+
+        if settings.showRAM {
+            let value = settings.ramShowFree ? stats.ramFree : stats.ramUsed
+            if labels {
+                let label = settings.ramShowFree ? "RAM A" : "RAM U"
+                parts.append(roundedRAM ? String(format: "%@ %.0fG", label, value) : String(format: "%@ %.1fG", label, value))
+            } else {
+                parts.append(roundedRAM ? String(format: "%.0fG", value) : String(format: "%.1fG", value))
+            }
+        }
+
+        if settings.showGPU {
+            parts.append(labels ? String(format: "GPU %.0f%%", stats.gpuUsage) : String(format: "%.0f%%", stats.gpuUsage))
+        }
+
+        if settings.showTemp {
+            parts.append(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))
+        }
+
+        if includeNetwork {
+            parts.append("D\(formatBitsPerSecond(stats.downloadSpeed, compact: true)) U\(formatBitsPerSecond(stats.uploadSpeed, compact: true))")
+        }
+
+        return parts.isEmpty ? "TopStats" : parts.joined(separator: separator)
+    }
+
+    private func measuredMenuBarWidth(_ title: String, fontSize: CGFloat) -> CGFloat {
+        let font = menuBarFont(size: fontSize)
+        return (title as NSString).size(withAttributes: [.font: font]).width + 18
+    }
+
+    private func menuBarTitleBudget() -> CGFloat {
+        guard !NSScreen.screens.isEmpty else { return 260 }
+
+        let statusAreaWidths = NSScreen.screens.map { screen -> CGFloat in
+            if let rightArea = screen.auxiliaryTopRightArea {
+                return rightArea.width
+            }
+            return screen.visibleFrame.width
+        }
+        let smallestStatusArea = statusAreaWidths.min() ?? 260
+        let hasNotchedDisplay = NSScreen.screens.contains { $0.auxiliaryTopRightArea != nil }
+
+        if hasNotchedDisplay {
+            return min(150, max(110, smallestStatusArea * 0.19))
+        }
+
+        let narrowestScreen = NSScreen.screens.map { $0.visibleFrame.width }.min() ?? smallestStatusArea
+        if narrowestScreen < 1500 {
+            return min(260, max(170, narrowestScreen * 0.18))
+        }
+
+        return min(340, max(240, smallestStatusArea * 0.18))
     }
 
     private func menuBarTooltip() -> String {
