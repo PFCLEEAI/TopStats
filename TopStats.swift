@@ -2979,13 +2979,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var tempHelperProcess: Process?
     private var dashboardHost: NSHostingView<TopStatsDashboardView>?
     private var dashboardItem: NSMenuItem?
-    private var menuBarOverlayWindow: NSPanel?
-    private var menuBarOverlayButton: NSButton?
     private var lastTitle = ""
     private var lastTooltip = ""
-    private var lastOverlayTitle = ""
     private var lastTitleFontSize: CGFloat = 12
     private var screenRefreshWorkItems: [DispatchWorkItem] = []
+    private var cachedFreeStatusWidth: CGFloat?
+    private var freeStatusWidthMeasuredAt: TimeInterval = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if settings.launchAtLogin {
@@ -3029,13 +3028,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let button = statusItem.button {
             button.font = menuBarFont(size: lastTitleFontSize)
-            button.image = nil
-            button.imagePosition = .noImage
+            // Every other status item on a crowded bar is a ~34pt icon. TopStats
+            // used to be a 148-278pt text-only item, so it was always the one
+            // macOS dropped when the bar filled up. The icon is the part that
+            // must survive; the text is what gets traded away.
+            button.image = Self.menuBarIcon
+            button.imagePosition = .imageLeading
             button.toolTip = "TopStats"
         }
 
         statusItem.menu = makeDashboardMenu()
     }
+
+    /// Template image so it inherits menu-bar tint in light/dark and under
+    /// wallpaper tinting, exactly like the system's own items.
+    private static let menuBarIcon: NSImage? = {
+        let names = ["gauge.with.dots.needle.33percent", "gauge.medium", "speedometer", "chart.bar.fill"]
+        for name in names {
+            if let image = NSImage(systemSymbolName: name, accessibilityDescription: "TopStats") {
+                let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+                let configured = image.withSymbolConfiguration(config) ?? image
+                configured.isTemplate = true
+                return configured
+            }
+        }
+        return nil
+    }()
 
     private func makeDashboardMenu() -> NSMenu {
         let menu = NSMenu()
@@ -3109,12 +3127,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastTitle = title
             button.title = title
         }
+        // Icon-only when nothing fits: `.imageLeading` with an empty title still
+        // reserves the text inset, which is exactly the width we are fighting for.
+        let position: NSControl.ImagePosition = title.isEmpty ? .imageOnly : .imageLeading
+        if button.imagePosition != position {
+            button.imagePosition = position
+        }
         let tooltip = menuBarTooltip()
         if tooltip != lastTooltip {
             lastTooltip = tooltip
             button.toolTip = tooltip
         }
-        updateMenuBarOverlay(title: laptopOverlayTitle(), tooltip: tooltip)
     }
 
     private func scheduleScreenRefresh(after delay: TimeInterval, recreate: Bool) {
@@ -3138,8 +3161,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dashboardItem = nil
         lastTitle = ""
         lastTooltip = ""
-        lastOverlayTitle = ""
         lastTitleFontSize = 12
+        // A plug/unplug changes which bars exist and how crowded each one is —
+        // the cached occupancy measurement is stale by definition here.
+        cachedFreeStatusWidth = nil
+        freeStatusWidthMeasuredAt = 0
         configureStatusItem()
         updateMenuBarTitle()
     }
@@ -3150,72 +3176,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.isVisible = true
         lastTitle = ""
         lastTooltip = ""
-        lastOverlayTitle = ""
         updateMenuBarTitle()
     }
 
-    private func updateMenuBarOverlay(title: String, tooltip: String) {
-        guard let screen = NSScreen.screens.first(where: { $0.auxiliaryTopLeftArea != nil }),
-              let leftArea = screen.auxiliaryTopLeftArea else {
-            menuBarOverlayWindow?.orderOut(nil)
-            return
-        }
-
-        if menuBarOverlayWindow == nil {
-            let panel = NSPanel(
-                contentRect: .zero,
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
-            )
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = false
-            panel.level = .statusBar
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-            panel.hidesOnDeactivate = false
-
-            let button = NSButton(frame: .zero)
-            button.isBordered = false
-            button.bezelStyle = .regularSquare
-            button.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
-            button.alignment = .center
-            button.lineBreakMode = .byTruncatingTail
-            button.target = self
-            button.action = #selector(menuBarOverlayClicked)
-            panel.contentView = button
-
-            menuBarOverlayWindow = panel
-            menuBarOverlayButton = button
-        }
-
-        let width = min(280, max(150, leftArea.width * 0.36))
-        let frame = NSRect(
-            x: leftArea.maxX - width - 8,
-            y: leftArea.minY,
-            width: width,
-            height: leftArea.height
-        )
-        menuBarOverlayWindow?.setFrame(frame, display: true)
-        menuBarOverlayButton?.frame = NSRect(origin: .zero, size: frame.size)
-        menuBarOverlayButton?.toolTip = tooltip
-
-        if title != lastOverlayTitle {
-            lastOverlayTitle = title
-            menuBarOverlayButton?.title = title
-        }
-
-        menuBarOverlayWindow?.orderFrontRegardless()
-    }
-
-    private func laptopOverlayTitle() -> String {
-        menuBarTitle(labels: true, roundedRAM: false, includeNetwork: false, separator: "  ")
-    }
-
-    @objc private func menuBarOverlayClicked() {
-        guard let button = menuBarOverlayButton, let menu = statusItem?.menu else { return }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
-    }
+    // REMOVED in 1.8.0: the "notch-safe menu-bar overlay" — a borderless NSPanel
+    // that drew the stats into `screen.auxiliaryTopLeftArea`. That area is the
+    // frontmost app's MENU region, not free space: it rendered on top of Edge's
+    // "Window"/"Help" menus and swallowed clicks meant for them. Its width is a
+    // function of whichever app is frontmost (Finder 6 menus, Edge 9, Xcode 12+)
+    // and macOS exposes no API for where those menus end, so no offset can be
+    // safe for every app. The item now lives only in the system status area,
+    // sized to the space that measurably exists there.
 
     private func menuBarFont(size: CGFloat) -> NSFont {
         NSFont.monospacedSystemFont(ofSize: size, weight: .medium)
@@ -3233,7 +3204,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        return MenuBarRender(title: candidates.last ?? "TopStats", fontSize: 9)
+        // Nothing fits: show the icon alone rather than let macOS drop the whole
+        // item (the old behaviour — an oversized text item was simply hidden on
+        // the crowded built-in bar, which is what made TopStats "disappear").
+        return MenuBarRender(title: "", fontSize: 9)
     }
 
     private func menuBarTitleCandidates() -> [String] {
@@ -3315,33 +3289,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return parts.isEmpty ? "TopStats" : parts.joined(separator: separator)
     }
 
+    /// Full on-screen width the item needs: symbol + inter-element gap + text +
+    /// the button's own horizontal insets. `MenuBarLayout.iconWidth` is 0 when no
+    /// symbol resolved, so this degrades to the old text-only measurement.
     private func measuredMenuBarWidth(_ title: String, fontSize: CGFloat) -> CGFloat {
+        let iconWidth = Self.menuBarIcon?.size.width ?? 0
+        if title.isEmpty {
+            return iconWidth + MenuBarLayout.buttonInset
+        }
         let font = menuBarFont(size: fontSize)
-        return (title as NSString).size(withAttributes: [.font: font]).width + 18
+        let textWidth = (title as NSString).size(withAttributes: [.font: font]).width
+        let gap: CGFloat = iconWidth > 0 ? MenuBarLayout.iconTextGap : 0
+        return iconWidth + gap + textWidth + MenuBarLayout.buttonInset
     }
 
+    /// How much room the item actually has, rather than a fraction of the screen.
+    ///
+    /// The old version returned `min(150, statusArea * 0.19)` — a guess with no
+    /// relationship to reality. On this machine the notched display's status area
+    /// is 772pt wide but 728pt of it is already taken by 16 other items, so the
+    /// true budget was ~44pt while the guess said 146pt. The item asked for more
+    /// room than existed and macOS silently dropped it from that bar — the actual
+    /// reason TopStats "disappeared" on the built-in screen.
+    ///
+    /// Status items pack right-to-left, so the free space on a given menu bar is
+    /// the gap between the start of its usable status area and the leftmost item
+    /// already there. One `NSStatusItem` renders a single shared title on every
+    /// display, so the title must fit the tightest bar we can appear on at all.
+    ///
+    /// Crucially, a bar with no room for even the bare icon is EXCLUDED rather
+    /// than allowed to govern: macOS drops us from that bar no matter what we do,
+    /// so shrinking the title to "fit" it buys nothing and needlessly strips the
+    /// numbers from the roomy bars where we ARE visible.
     private func menuBarTitleBudget() -> CGFloat {
-        guard !NSScreen.screens.isEmpty else { return 260 }
+        if let cached = cachedFreeStatusWidth,
+           Date().timeIntervalSince1970 - freeStatusWidthMeasuredAt < MenuBarLayout.measurementTTL {
+            return cached
+        }
+        let measured = measureFreeStatusWidth() ?? MenuBarLayout.fallbackBudget
+        cachedFreeStatusWidth = measured
+        freeStatusWidthMeasuredAt = Date().timeIntervalSince1970
+        return measured
+    }
 
-        let statusAreaWidths = NSScreen.screens.map { screen -> CGFloat in
-            if let rightArea = screen.auxiliaryTopRightArea {
-                return rightArea.width
+    /// Returns nil when the window list is unreadable, so the caller falls back to
+    /// a conservative fixed budget instead of trusting a bad measurement.
+    private func measureFreeStatusWidth() -> CGFloat? {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        // Layer 25 is the menu-bar status-item layer. Our own item must be
+        // excluded or we would measure ourselves as occupying the gap we are
+        // trying to size into, and ratchet down every tick.
+        let items: [(x: CGFloat, y: CGFloat)] = windows.compactMap { window in
+            guard (window[kCGWindowLayer as String] as? Int) == MenuBarLayout.statusItemLayer,
+                  (window[kCGWindowOwnerPID as String] as? Int32) != ownPID,
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = bounds["X"], let y = bounds["Y"] else { return nil }
+            return (x, y)
+        }
+        guard !items.isEmpty else { return nil }
+
+        var budgets: [CGFloat] = []
+        for screen in NSScreen.screens {
+            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { continue }
+            // CGWindow bounds and CGDisplayBounds share the same flipped, global
+            // coordinate space; NSScreen.frame does not. Compare in CG space.
+            let displayBounds = CGDisplayBounds(displayID)
+
+            // Items belonging to THIS bar: same top edge, inside this display's x range.
+            let onThisBar = items.filter { item in
+                abs(item.y - displayBounds.minY) < MenuBarLayout.barRowTolerance
+                    && item.x >= displayBounds.minX
+                    && item.x < displayBounds.maxX
             }
-            return screen.visibleFrame.width
-        }
-        let smallestStatusArea = statusAreaWidths.min() ?? 260
-        let hasNotchedDisplay = NSScreen.screens.contains { $0.auxiliaryTopRightArea != nil }
+            guard let leftmost = onThisBar.map(\.x).min() else { continue }
 
-        if hasNotchedDisplay {
-            return min(150, max(110, smallestStatusArea * 0.19))
+            // Where usable status space starts: right of the notch when there is one,
+            // otherwise a conservative reserve for the frontmost app's menus (their
+            // true extent is not knowable, and guessing small is what caused the
+            // overlay to collide with them — so we guess LARGE here, which only ever
+            // shrinks our own title).
+            let statusStart: CGFloat
+            if let rightArea = screen.auxiliaryTopRightArea {
+                statusStart = rightArea.minX - screen.frame.minX + displayBounds.minX + MenuBarLayout.notchClearance
+            } else {
+                statusStart = displayBounds.minX + MenuBarLayout.appMenuReserve
+            }
+
+            budgets.append(max(0, leftmost - statusStart - MenuBarLayout.safetyMargin))
         }
 
-        let narrowestScreen = NSScreen.screens.map { $0.visibleFrame.width }.min() ?? smallestStatusArea
-        if narrowestScreen < 1500 {
-            return min(260, max(170, narrowestScreen * 0.18))
-        }
+        // Ignore bars too tight for even the icon — we are dropped from those
+        // regardless, so letting them set the budget would only cost us the text
+        // on the bars where we do appear.
+        let iconOnly = measuredMenuBarWidth("", fontSize: 12)
+        let usable = budgets.filter { $0 >= iconOnly }
+        guard let tightest = (usable.isEmpty ? budgets.max() : usable.min()) else { return nil }
+        return min(MenuBarLayout.maxBudget, tightest)
+    }
 
-        return min(340, max(240, smallestStatusArea * 0.18))
+    private enum MenuBarLayout {
+        static let statusItemLayer = 25
+        static let barRowTolerance: CGFloat = 5
+        /// Generous reserve for app menus on displays with no notch, where macOS
+        /// gives us no `auxiliaryTopRightArea` to anchor to.
+        static let appMenuReserve: CGFloat = 620
+        /// macOS never places a status item flush against the notch — measured on
+        /// this machine, the leftmost item always lands ~46pt right of where
+        /// `auxiliaryTopRightArea` claims the region begins. Treating that strip as
+        /// free space is what made a "46pt gap" look available on a bar that in
+        /// truth had none, so we subtract it before deciding anything fits.
+        static let notchClearance: CGFloat = 48
+        /// Keeps us from wedging flush against the neighbouring item.
+        static let safetyMargin: CGFloat = 6
+        static let iconTextGap: CGFloat = 4
+        static let buttonInset: CGFloat = 12
+        static let maxBudget: CGFloat = 340
+        /// Used only when the window list cannot be read at all.
+        static let fallbackBudget: CGFloat = 120
+        /// Other apps add and remove status items while we run; re-measure often
+        /// enough to notice, rarely enough to stay off the 5s sampling hot path.
+        static let measurementTTL: TimeInterval = 10
     }
 
     private func menuBarTooltip() -> String {

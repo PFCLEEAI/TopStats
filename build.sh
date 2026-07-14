@@ -61,9 +61,9 @@ cat > "TopStats.app/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.7.1</string>
+    <string>1.8.1</string>
     <key>CFBundleVersion</key>
-    <string>23</string>
+    <string>25</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
