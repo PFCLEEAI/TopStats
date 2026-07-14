@@ -2310,7 +2310,7 @@ struct PendingKillConfirmation {
 }
 
 private enum CodingAgentFilter: String, CaseIterable, Identifiable {
-    case all = "All Agents"
+    case all = "All"
     case codex = "Codex"
     case claude = "Claude"
     case other = "Other"
@@ -2390,52 +2390,62 @@ struct CodingAgentsSection: View {
     }
 
     private var header: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "terminal.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(Palette.red.opacity(0.85))
-            Text("Coding Agents")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-            Spacer()
-            Menu {
-                ForEach(CodingAgentFilter.allCases) { filter in
-                    Button {
-                        agentFilter = filter
-                    } label: {
-                        if filter == agentFilter {
-                            Label(filter.rawValue, systemImage: "checkmark")
-                        } else {
-                            Text(filter.rawValue)
-                        }
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Palette.red.opacity(0.85))
+                Text("Coding Agents")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                Spacer()
+
+                Button {
+                    sortOrder.toggle()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: sortOrder.icon)
+                        Text(sortOrder.label)
                     }
-                }
-            } label: {
-                Label(agentFilter.rawValue, systemImage: "line.3.horizontal.decrease.circle")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Filter coding agents")
-
-            Button {
-                sortOrder.toggle()
-            } label: {
-                Label(sortOrder.label, systemImage: sortOrder.icon)
                     .font(.system(size: 10, weight: .bold, design: .rounded))
-            }
-            .buttonStyle(.plain)
-            .foregroundColor(Palette.muted)
-            .help(sortOrder.help)
+                    .foregroundColor(Palette.muted)
+                    .padding(.horizontal, 7)
+                    .frame(height: 20)
+                    // Without an explicit shape the plain-button hit region is
+                    // just the glyphs — a few pt of dead space between the icon
+                    // and the text reads as "the button doesn't work".
+                    .contentShape(Capsule())
+                    .background(Capsule().fill(Color.white.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                .help(sortOrder.help)
 
-            Button {
-                stats.refreshCodingAgents()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 11, weight: .semibold))
+                Button {
+                    stats.refreshCodingAgents()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Palette.muted)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Refresh coding agents list")
             }
-            .buttonStyle(.plain)
-            .foregroundColor(Palette.muted)
-            .help("Refresh coding agents list")
+
+            // Deliberately a segmented Picker, NOT a SwiftUI `Menu`: this view is
+            // hosted in an NSHostingView inside an NSMenuItem of the status-item
+            // menu, and a `Menu` must present its own popup while that menu is
+            // already tracking — it silently never opens (same constraint that
+            // forced the Kill confirmation inline instead of an NSAlert).
+            // Segmented pickers and plain buttons work fine in this context.
+            Picker("", selection: $agentFilter) {
+                ForEach(CodingAgentFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .labelsHidden()
         }
     }
 
@@ -2467,16 +2477,23 @@ struct CodingAgentsSection: View {
             assert(!isSelf, "CodingAgentsSection: self PID leaked through Sprint 1's exclusion")
             return !isSelf && agentFilter.includes(process)
         }
+        // Idle agents nearly all report 0.0% CPU, so CPU alone leaves the whole
+        // list tied. Memory then uptime break those ties, and the final PID
+        // tiebreak follows the sort direction — otherwise flipping High/Low on a
+        // list of all-0.0% rows produced a byte-identical order and the toggle
+        // looked broken.
+        let ascending = (sortOrder == .lowestCPU)
         return visible.sorted { lhs, rhs in
-            if lhs.cpuPercent == rhs.cpuPercent {
-                return lhs.pid < rhs.pid
+            if lhs.cpuPercent != rhs.cpuPercent {
+                return ascending ? lhs.cpuPercent < rhs.cpuPercent : lhs.cpuPercent > rhs.cpuPercent
             }
-            switch sortOrder {
-            case .highestCPU:
-                return lhs.cpuPercent > rhs.cpuPercent
-            case .lowestCPU:
-                return lhs.cpuPercent < rhs.cpuPercent
+            if lhs.rssMB != rhs.rssMB {
+                return ascending ? lhs.rssMB < rhs.rssMB : lhs.rssMB > rhs.rssMB
             }
+            if lhs.etimeSeconds != rhs.etimeSeconds {
+                return ascending ? lhs.etimeSeconds < rhs.etimeSeconds : lhs.etimeSeconds > rhs.etimeSeconds
+            }
+            return ascending ? lhs.pid < rhs.pid : lhs.pid > rhs.pid
         }
     }
 }
