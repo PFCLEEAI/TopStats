@@ -28,6 +28,17 @@ if [ -f "TopStats.icns" ]; then
     echo "Added app icon"
 fi
 
+# Coding-agent row logos (CodingAgentLogo loads these by name from the bundle;
+# a missing file degrades to the terminal placeholder, so fail loudly here instead)
+for logo in claude-code codex; do
+    if [ ! -f "assets/agent-logos/$logo.png" ]; then
+        echo "ERROR: missing assets/agent-logos/$logo.png" >&2
+        exit 1
+    fi
+    cp "assets/agent-logos/$logo.png" "TopStats.app/Contents/Resources/"
+done
+echo "Added coding-agent logos"
+
 cat > "TopStats.app/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,9 +61,9 @@ cat > "TopStats.app/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.6.3</string>
+    <string>1.7.0</string>
     <key>CFBundleVersion</key>
-    <string>21</string>
+    <string>22</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

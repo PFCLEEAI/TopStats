@@ -2309,11 +2309,49 @@ struct PendingKillConfirmation {
     let isZombie: Bool
 }
 
+private enum CodingAgentFilter: String, CaseIterable, Identifiable {
+    case all = "All Agents"
+    case codex = "Codex"
+    case claude = "Claude"
+    case other = "Other"
+
+    var id: String { rawValue }
+
+    func includes(_ process: CodingAgentProcess) -> Bool {
+        let name = process.binaryName.lowercased()
+        switch self {
+        case .all:
+            return true
+        case .codex:
+            return name == "codex"
+        case .claude:
+            return name == "claude" || name == "claude.exe"
+        case .other:
+            return name != "codex" && name != "claude" && name != "claude.exe"
+        }
+    }
+}
+
+private enum CodingAgentSortOrder {
+    case highestCPU
+    case lowestCPU
+
+    var icon: String { self == .highestCPU ? "arrow.down" : "arrow.up" }
+    var label: String { self == .highestCPU ? "High" : "Low" }
+    var help: String { self == .highestCPU ? "CPU: highest first" : "CPU: lowest first" }
+
+    mutating func toggle() {
+        self = self == .highestCPU ? .lowestCPU : .highestCPU
+    }
+}
+
 /// New section behind the CPU tab's Coding Agents sub-toggle, bound to
 /// `CodingAgentProcess` — NOT `ConsumerRow`/`ProcessConsumer` (those stay
 /// byte-for-byte unmodified per the contract).
 struct CodingAgentsSection: View {
     @ObservedObject var stats: SystemStats
+    @State private var agentFilter: CodingAgentFilter = .all
+    @State private var sortOrder: CodingAgentSortOrder = .highestCPU
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2359,6 +2397,36 @@ struct CodingAgentsSection: View {
             Text("Coding Agents")
                 .font(.system(size: 12, weight: .bold, design: .rounded))
             Spacer()
+            Menu {
+                ForEach(CodingAgentFilter.allCases) { filter in
+                    Button {
+                        agentFilter = filter
+                    } label: {
+                        if filter == agentFilter {
+                            Label(filter.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(filter.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                Label(agentFilter.rawValue, systemImage: "line.3.horizontal.decrease.circle")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Filter coding agents")
+
+            Button {
+                sortOrder.toggle()
+            } label: {
+                Label(sortOrder.label, systemImage: sortOrder.icon)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(Palette.muted)
+            .help(sortOrder.help)
+
             Button {
                 stats.refreshCodingAgents()
             } label: {
@@ -2376,7 +2444,7 @@ struct CodingAgentsSection: View {
             Spacer(minLength: 0)
             HStack(spacing: 6) {
                 Image(systemName: "terminal")
-                Text("No coding agents running")
+                Text(agentFilter == .all ? "No coding agents running" : "No \(agentFilter.rawValue) agents running")
             }
             .font(.system(size: 12, weight: .medium))
             .foregroundColor(Palette.muted)
@@ -2394,11 +2462,81 @@ struct CodingAgentsSection: View {
     /// through, the row is skipped rather than rendered — never a silent
     /// pass-through.
     private var filteredProcesses: [CodingAgentProcess] {
-        stats.codingAgentProcesses.filter { process in
+        let visible = stats.codingAgentProcesses.filter { process in
             let isSelf = process.pid == ProcessInfo.processInfo.processIdentifier
             assert(!isSelf, "CodingAgentsSection: self PID leaked through Sprint 1's exclusion")
-            return !isSelf
+            return !isSelf && agentFilter.includes(process)
         }
+        return visible.sorted { lhs, rhs in
+            if lhs.cpuPercent == rhs.cpuPercent {
+                return lhs.pid < rhs.pid
+            }
+            switch sortOrder {
+            case .highestCPU:
+                return lhs.cpuPercent > rhs.cpuPercent
+            case .lowestCPU:
+                return lhs.cpuPercent < rhs.cpuPercent
+            }
+        }
+    }
+}
+
+private struct CodingAgentLogo: View {
+    let binaryName: String
+
+    // Bundled in Contents/Resources by build.sh (sources live in assets/agent-logos/).
+    // Deliberately NOT read from /Applications/{Codex,Claude}.app: the Claude *desktop*
+    // app icon is the wrong mark for a `claude` CLI process (that's Claude Code), and
+    // both lookups break whenever the user has not installed those GUI apps.
+    private static let codexLogo = loadLogo(resource: "codex")
+    private static let claudeLogo = loadLogo(resource: "claude-code")
+
+    var body: some View {
+        Group {
+            if let image = Self.logo(for: binaryName) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                Image(systemName: "terminal.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(6)
+                    .foregroundColor(Palette.muted)
+                    .background(Palette.panelStrong)
+            }
+        }
+        .scaledToFit()
+        .frame(width: 30, height: 30)
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityLabel("\(displayName) logo")
+    }
+
+    private var displayName: String {
+        switch binaryName.lowercased() {
+        case "codex": return "Codex"
+        case "claude", "claude.exe": return "Claude"
+        default: return binaryName
+        }
+    }
+
+    private static func logo(for binaryName: String) -> NSImage? {
+        switch binaryName.lowercased() {
+        case "codex":
+            return codexLogo
+        case "claude", "claude.exe":
+            return claudeLogo
+        default:
+            return nil
+        }
+    }
+
+    /// Returns nil when run from the bare `swiftc` binary rather than the app
+    /// bundle (dev builds have no Resources dir) — the row then shows the
+    /// neutral terminal placeholder instead of a wrong-brand icon.
+    private static func loadLogo(resource: String) -> NSImage? {
+        guard let url = Bundle.main.url(forResource: resource, withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
     }
 }
 
@@ -2429,6 +2567,7 @@ struct CodingAgentRow: View {
     private var normalContent: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 8) {
+                CodingAgentLogo(binaryName: process.binaryName)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(process.binaryName)
@@ -2463,11 +2602,6 @@ struct CodingAgentRow: View {
                 Text(killMessage)
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(Palette.red)
-            }
-            if let throttleMessage = stats.lastThrottleResult[process.pid] {
-                Text(throttleMessage)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(Palette.cyan)
             }
         }
     }
@@ -2561,40 +2695,19 @@ struct CodingAgentRow: View {
     }
 
     private var actionButtons: some View {
-        HStack(spacing: 6) {
-            // Throttle: non-destructive, neutral (non-red) style, distinct
-            // shape/color from both Kill (below) and the Memory card's
-            // capsule "Free Up" button.
-            Button {
-                throttle()
-            } label: {
-                Image(systemName: "tortoise.fill")
-                    .frame(width: 15, height: 15)
-            }
-            .buttonStyle(IconButtonStyle(tint: Palette.cyan))
-            .help("Throttle to background (taskpolicy -b) — non-destructive; lasts for this process's lifetime, no un-throttle control exposed yet.")
-
-            // Kill: distinct shape (small icon-button, never the Memory
-            // card's capsule), red-tinted, full confirmation flow.
-            Button {
-                requestKillConfirmation()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .frame(width: 15, height: 15)
-            }
-            .buttonStyle(IconButtonStyle(tint: Palette.red))
-            .disabled(process.startTime == nil)
-            .help(process.startTime == nil
-                ? "Kill unavailable — process start time could not be determined."
-                : "Kill this process")
+        // Kill remains the only row action; the turtle throttle affordance was
+        // removed so the leading visual is reserved for the actual agent logo.
+        Button {
+            requestKillConfirmation()
+        } label: {
+            Image(systemName: "xmark.circle.fill")
+                .frame(width: 15, height: 15)
         }
-    }
-
-    private func throttle() {
-        let pid = process.pid
-        DispatchQueue.global(qos: .userInitiated).async {
-            stats.throttleAgentProcess(pid: pid)
-        }
+        .buttonStyle(IconButtonStyle(tint: Palette.red))
+        .disabled(process.startTime == nil)
+        .help(process.startTime == nil
+            ? "Kill unavailable — process start time could not be determined."
+            : "Kill this process")
     }
 
     /// Computes the live child count BEFORE showing the confirmation (per
