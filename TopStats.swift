@@ -1,7 +1,6 @@
 import Cocoa
 import SwiftUI
 import IOKit
-import Network
 
 // MARK: - Models
 
@@ -113,6 +112,318 @@ private struct ProcessAggregate {
     }
 }
 
+// MARK: - Network Speed Test
+
+struct NetworkSpeedResult: Equatable {
+    let downloadBitsPerSecond: Double
+    let uploadBitsPerSecond: Double
+    let idleLatencyMilliseconds: Double
+    let responsivenessRPM: Double
+    let interfaceName: String
+    let completedAt: Date
+}
+
+enum NetworkTestPhase: Equatable {
+    case idle
+    case testing
+    case completed
+    case failed(String)
+}
+
+enum NetworkSpeedTestError: LocalizedError {
+    case invalidOutput
+    case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidOutput:
+            return "The speed test returned an unreadable result. Please try again."
+        case .commandFailed(let message):
+            return message
+        }
+    }
+}
+
+/// Runs only after an explicit user action. macOS' built-in `networkQuality`
+/// provides the test endpoint and methodology, so TopStats needs no private
+/// server, third-party SDK, account, or continuously-running network sampler.
+final class NetworkSpeedTester: ObservableObject, @unchecked Sendable {
+    @Published private(set) var phase: NetworkTestPhase = .idle
+    @Published private(set) var result: NetworkSpeedResult?
+    @Published private(set) var startedAt: Date?
+    /// Approximate interface throughput while the user-started test is active.
+    /// These values are intentionally sampled only for the lifetime of a test;
+    /// the final `networkQuality` capacity remains the authoritative result.
+    @Published private(set) var liveDownloadBitsPerSecond: Double = 0
+    @Published private(set) var liveUploadBitsPerSecond: Double = 0
+
+    private let readQueue = DispatchQueue(label: "TopStats.NetworkSpeedTest", qos: .userInitiated)
+    private let transferQueue = DispatchQueue(label: "TopStats.NetworkLiveTransfer", qos: .utility)
+    private var process: Process?
+    private var activeRunID: UUID?
+    private var transferTimer: DispatchSourceTimer?
+    private var previousTransferBytes: (incoming: UInt64, outgoing: UInt64)?
+    private var previousTransferDate: Date?
+    private var smoothedDownloadBitsPerSecond: Double = 0
+    private var smoothedUploadBitsPerSecond: Double = 0
+
+    var isTesting: Bool { phase == .testing }
+
+    func start() {
+        guard !isTesting else { return }
+
+        let runID = UUID()
+        let task = Process()
+        let tempDirectory = FileManager.default.temporaryDirectory
+        let outputURL = tempDirectory.appendingPathComponent("topstats-network-\(runID.uuidString).json")
+        let errorURL = tempDirectory.appendingPathComponent("topstats-network-\(runID.uuidString).err")
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+        guard let output = try? FileHandle(forWritingTo: outputURL),
+              let errors = try? FileHandle(forWritingTo: errorURL) else {
+            phase = .failed("Unable to prepare the speed test output.")
+            try? FileManager.default.removeItem(at: outputURL)
+            try? FileManager.default.removeItem(at: errorURL)
+            return
+        }
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/networkQuality")
+        task.arguments = ["-c", "-M", "30"]
+        task.standardOutput = output
+        task.standardError = errors
+
+        activeRunID = runID
+        process = task
+        result = nil
+        liveDownloadBitsPerSecond = 0
+        liveUploadBitsPerSecond = 0
+        startedAt = Date()
+        phase = .testing
+
+        do {
+            try task.run()
+        } catch {
+            try? output.close()
+            try? errors.close()
+            try? FileManager.default.removeItem(at: outputURL)
+            try? FileManager.default.removeItem(at: errorURL)
+            activeRunID = nil
+            process = nil
+            startedAt = nil
+            phase = .failed("Unable to start the macOS speed test: \(error.localizedDescription)")
+            return
+        }
+
+        startLiveTransferSampling(runID: runID)
+
+        // Write to temporary files instead of pipes. `networkQuality -c` can
+        // emit a large JSON document; files avoid pipe-buffer deadlocks and let
+        // the worker read complete output only after the process has exited.
+        readQueue.async { [weak self] in
+            task.waitUntilExit()
+            try? output.close()
+            try? errors.close()
+            let stdout = (try? Data(contentsOf: outputURL)) ?? Data()
+            let stderr = (try? Data(contentsOf: errorURL)) ?? Data()
+            try? FileManager.default.removeItem(at: outputURL)
+            try? FileManager.default.removeItem(at: errorURL)
+
+            DispatchQueue.main.async {
+                self?.finish(
+                    runID: runID,
+                    status: task.terminationStatus,
+                    stdout: stdout,
+                    stderr: stderr
+                )
+            }
+        }
+    }
+
+    func cancel() {
+        guard isTesting else { return }
+        activeRunID = nil
+        let running = process
+        process = nil
+        stopLiveTransferSampling()
+        startedAt = nil
+        phase = .idle
+        result = nil
+        liveDownloadBitsPerSecond = 0
+        liveUploadBitsPerSecond = 0
+        if running?.isRunning == true {
+            running?.terminate()
+        }
+    }
+
+    private func finish(runID: UUID, status: Int32, stdout: Data, stderr: Data) {
+        guard activeRunID == runID else { return }
+        activeRunID = nil
+        process = nil
+        stopLiveTransferSampling()
+        startedAt = nil
+
+        do {
+            guard status == 0 else {
+                throw NetworkSpeedTestError.commandFailed(Self.failureMessage(jsonData: stdout, stderr: stderr))
+            }
+            let parsed = try Self.parse(data: stdout)
+            result = parsed
+            phase = .completed
+        } catch {
+            result = nil
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Samples the active `en*` interface byte counters while `networkQuality`
+    /// is transferring data. The test traffic dominates these deltas, giving
+    /// people a useful live expectation without pretending it is the final
+    /// capacity measurement. An EWMA keeps the numbers readable while still
+    /// reacting several times per second.
+    private func startLiveTransferSampling(runID: UUID) {
+        stopLiveTransferSampling()
+        // A separate queue is required because `readQueue` waits synchronously
+        // for `networkQuality` to exit before reading its final JSON.
+        let timer = DispatchSource.makeTimerSource(queue: transferQueue)
+        transferTimer = timer
+        previousTransferBytes = nil
+        previousTransferDate = nil
+        smoothedDownloadBitsPerSecond = 0
+        smoothedUploadBitsPerSecond = 0
+        timer.schedule(deadline: .now(), repeating: .milliseconds(400), leeway: .milliseconds(40))
+        timer.setEventHandler { [weak self] in
+            self?.sampleLiveTransfer(runID: runID)
+        }
+        timer.resume()
+    }
+
+    private func stopLiveTransferSampling() {
+        transferTimer?.setEventHandler {}
+        transferTimer?.cancel()
+        transferTimer = nil
+        // Drain any already-running sample before resetting its queue-owned
+        // state, so a cancelled run cannot seed the next run's baseline.
+        transferQueue.sync {
+            previousTransferBytes = nil
+            previousTransferDate = nil
+            smoothedDownloadBitsPerSecond = 0
+            smoothedUploadBitsPerSecond = 0
+        }
+    }
+
+    private func sampleLiveTransfer(runID: UUID) {
+        let bytes = Self.networkBytes()
+        let now = Date()
+        defer {
+            previousTransferBytes = bytes
+            previousTransferDate = now
+        }
+        guard let previous = previousTransferBytes,
+              let previousDate = previousTransferDate else { return }
+
+        let rates = Self.transferRates(
+            previousIncoming: previous.incoming,
+            previousOutgoing: previous.outgoing,
+            currentIncoming: bytes.incoming,
+            currentOutgoing: bytes.outgoing,
+            elapsed: now.timeIntervalSince(previousDate)
+        )
+        guard let rates else { return }
+
+        let smoothing = 0.42
+        smoothedDownloadBitsPerSecond = smoothedDownloadBitsPerSecond == 0
+            ? rates.download
+            : smoothing * rates.download + (1 - smoothing) * smoothedDownloadBitsPerSecond
+        smoothedUploadBitsPerSecond = smoothedUploadBitsPerSecond == 0
+            ? rates.upload
+            : smoothing * rates.upload + (1 - smoothing) * smoothedUploadBitsPerSecond
+
+        let download = smoothedDownloadBitsPerSecond
+        let upload = smoothedUploadBitsPerSecond
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.activeRunID == runID, self.isTesting else { return }
+            self.liveDownloadBitsPerSecond = download
+            self.liveUploadBitsPerSecond = upload
+        }
+    }
+
+    static func transferRates(
+        previousIncoming: UInt64,
+        previousOutgoing: UInt64,
+        currentIncoming: UInt64,
+        currentOutgoing: UInt64,
+        elapsed: TimeInterval
+    ) -> (download: Double, upload: Double)? {
+        guard elapsed > 0,
+              currentIncoming >= previousIncoming,
+              currentOutgoing >= previousOutgoing else { return nil }
+        return (
+            Double(currentIncoming - previousIncoming) * 8 / elapsed,
+            Double(currentOutgoing - previousOutgoing) * 8 / elapsed
+        )
+    }
+
+    private static func networkBytes() -> (incoming: UInt64, outgoing: UInt64) {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return (0, 0) }
+        defer { freeifaddrs(addresses) }
+
+        var incoming: UInt64 = 0
+        var outgoing: UInt64 = 0
+        var pointer: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = pointer {
+            let interface = current.pointee
+            let name = String(cString: interface.ifa_name)
+            if name.hasPrefix("en"),
+               let address = interface.ifa_addr,
+               Int32(address.pointee.sa_family) == AF_LINK,
+               let data = interface.ifa_data {
+                let counters = data.assumingMemoryBound(to: if_data.self).pointee
+                incoming += UInt64(counters.ifi_ibytes)
+                outgoing += UInt64(counters.ifi_obytes)
+            }
+            pointer = interface.ifa_next
+        }
+        return (incoming, outgoing)
+    }
+
+    static func parse(data: Data, completedAt: Date = Date()) throws -> NetworkSpeedResult {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let download = number(object["dl_throughput"]),
+              let upload = number(object["ul_throughput"]),
+              let latency = number(object["base_rtt"]),
+              let responsiveness = number(object["responsiveness"]),
+              let interface = object["interface_name"] as? String,
+              download >= 0, upload >= 0, latency >= 0, responsiveness >= 0 else {
+            throw NetworkSpeedTestError.invalidOutput
+        }
+
+        return NetworkSpeedResult(
+            downloadBitsPerSecond: download,
+            uploadBitsPerSecond: upload,
+            idleLatencyMilliseconds: latency,
+            responsivenessRPM: responsiveness,
+            interfaceName: interface,
+            completedAt: completedAt
+        )
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        (value as? NSNumber)?.doubleValue
+    }
+
+    private static func failureMessage(jsonData: Data, stderr: Data) -> String {
+        if let object = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+           let domain = object["error_domain"] as? String {
+            let code = (object["error_code"] as? NSNumber)?.intValue
+            return code.map { "Speed test failed (\(domain), code \($0)). Check your connection and try again." }
+                ?? "Speed test failed (\(domain)). Check your connection and try again."
+        }
+        let text = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let text, !text.isEmpty { return text }
+        return "Speed test failed. Check your connection and try again."
+    }
+}
+
 // MARK: - Settings
 
 final class AppSettings: ObservableObject {
@@ -120,7 +431,6 @@ final class AppSettings: ObservableObject {
     @Published var showRAM: Bool = true
     @Published var showGPU: Bool = true
     @Published var showTemp: Bool = true
-    @Published var showNetwork: Bool = false
     @Published var ramShowFree: Bool = false
     @Published var useFahrenheit: Bool = false
     @Published var launchAtLogin: Bool = true
@@ -140,8 +450,6 @@ final class AppSettings: ObservableObject {
         showRAM = defaults.object(forKey: "showRAM") as? Bool ?? true
         showGPU = defaults.object(forKey: "showGPU") as? Bool ?? true
         showTemp = defaults.object(forKey: "showTemp") as? Bool ?? true
-        // Network is opt-in: it belongs in the dashboard, not permanently in the menu bar.
-        showNetwork = defaults.object(forKey: "showNetwork") as? Bool ?? false
         ramShowFree = defaults.object(forKey: "ramShowFree") as? Bool ?? false
         useFahrenheit = defaults.object(forKey: "useFahrenheit") as? Bool ?? false
         launchAtLogin = defaults.object(forKey: "launchAtLogin") as? Bool ?? true
@@ -154,7 +462,6 @@ final class AppSettings: ObservableObject {
         defaults.set(showRAM, forKey: "showRAM")
         defaults.set(showGPU, forKey: "showGPU")
         defaults.set(showTemp, forKey: "showTemp")
-        defaults.set(showNetwork, forKey: "showNetwork")
         defaults.set(ramShowFree, forKey: "ramShowFree")
         defaults.set(useFahrenheit, forKey: "useFahrenheit")
         defaults.set(launchAtLogin, forKey: "launchAtLogin")
@@ -273,8 +580,6 @@ final class SystemStats: ObservableObject {
     /// `formatTemperature` converts to the user's chosen unit at display time.
     @Published var temperatureValue: Double = 0
     @Published var temperatureIsEstimate: Bool = false
-    @Published var downloadSpeed: Double = 0
-    @Published var uploadSpeed: Double = 0
     @Published var topCPUConsumers: [ProcessConsumer] = []
     @Published var topMemoryConsumers: [ProcessConsumer] = []
     @Published var gpuClientConsumers: [ProcessConsumer] = []
@@ -306,9 +611,6 @@ final class SystemStats: ObservableObject {
     private let agentActionQueue = DispatchQueue(label: "TopStats.AgentAction", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var prevCPUInfo: [Int32]?
-    private var prevNetworkIn: UInt64 = 0
-    private var prevNetworkOut: UInt64 = 0
-    private var prevNetworkTime: Date = Date()
     private var lastProcessSample = Date.distantPast
     private var lastGPUSample = Date.distantPast
     private var lastGPUClientSample = Date.distantPast
@@ -386,11 +688,6 @@ final class SystemStats: ObservableObject {
     }()
 
     init() {
-        let (inBytes, outBytes) = getNetworkBytes()
-        prevNetworkIn = inBytes
-        prevNetworkOut = outBytes
-        prevNetworkTime = Date()
-
         refreshAll()
         // DispatchSourceTimer fires straight on the sampling queue: no main
         // run-loop timer wakeup and no main->work queue hop per tick.
@@ -474,7 +771,6 @@ final class SystemStats: ObservableObject {
         let cpu = readCPU()
         let ram = readRAM()
         let temp = readTemperature()
-        let net = readNetwork()
 
         let now = Date()
         var gpu: Double?
@@ -519,10 +815,6 @@ final class SystemStats: ObservableObject {
             }
             if temp.value != self.temperatureValue { self.temperatureValue = temp.value; changed = true }
             if temp.isEstimate != self.temperatureIsEstimate { self.temperatureIsEstimate = temp.isEstimate; changed = true }
-            if let net {
-                if net.down != self.downloadSpeed { self.downloadSpeed = net.down; changed = true }
-                if net.up != self.uploadSpeed { self.uploadSpeed = net.up; changed = true }
-            }
             if let gpu, gpu != self.gpuUsage { self.gpuUsage = gpu; changed = true }
             if changed { self.lastUpdated = Date() }
             self.onSample?()
@@ -775,51 +1067,6 @@ final class SystemStats: ObservableObject {
         }
 
         return (estimatedTemp, true)
-    }
-
-    private func getNetworkBytes() -> (UInt64, UInt64) {
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
-            return (0, 0)
-        }
-        defer { freeifaddrs(ifaddr) }
-
-        var totalIn: UInt64 = 0
-        var totalOut: UInt64 = 0
-        var ptr = firstAddr
-
-        while true {
-            let name = String(cString: ptr.pointee.ifa_name)
-            if name.hasPrefix("en"), let data = ptr.pointee.ifa_data {
-                let networkData = data.assumingMemoryBound(to: if_data.self).pointee
-                totalIn += UInt64(networkData.ifi_ibytes)
-                totalOut += UInt64(networkData.ifi_obytes)
-            }
-
-            guard let next = ptr.pointee.ifa_next else { break }
-            ptr = next
-        }
-
-        return (totalIn, totalOut)
-    }
-
-    private func readNetwork() -> (down: Double, up: Double)? {
-        let (currentIn, currentOut) = getNetworkBytes()
-        let now = Date()
-        let elapsed = now.timeIntervalSince(prevNetworkTime)
-
-        var rates: (down: Double, up: Double)?
-        if elapsed > 0, prevNetworkIn > 0, currentIn >= prevNetworkIn, currentOut >= prevNetworkOut {
-            rates = (
-                Double(currentIn - prevNetworkIn) / elapsed,
-                Double(currentOut - prevNetworkOut) / elapsed
-            )
-        }
-
-        prevNetworkIn = currentIn
-        prevNetworkOut = currentOut
-        prevNetworkTime = now
-        return rates
     }
 
     /// One row of the shared `ps` scan. Carries every field BOTH the Top
@@ -1706,10 +1953,10 @@ final class SystemStats: ObservableObject {
 
 // MARK: - Formatting
 
-/// Network speeds display in bits per second (Kbps/Mbps/Gbps) with decimal units,
-/// matching how ISPs and speed tests report bandwidth.
-func formatBitsPerSecond(_ bytesPerSecond: Double, compact: Bool) -> String {
-    let bits = max(0, bytesPerSecond) * 8
+/// `networkQuality` reports bits per second. Keep that unit boundary explicit
+/// so a measured 300 Mbps result can never be accidentally multiplied by 8.
+func formatNetworkSpeed(_ bitsPerSecond: Double) -> String {
+    let bits = max(0, bitsPerSecond)
     let value: Double
     let unit: String
     if bits < 1_000_000 {
@@ -1727,9 +1974,6 @@ func formatBitsPerSecond(_ bytesPerSecond: Double, compact: Bool) -> String {
         ? String(format: "%.0f", value)
         : String(format: "%.1f", value)
 
-    if compact {
-        return number + unit.prefix(1)
-    }
     return "\(number) \(unit)"
 }
 
@@ -1921,6 +2165,13 @@ struct TopStatsDashboardView: View {
                 NotificationCenter.default.post(name: .topStatsOpenSettings, object: nil)
             } label: {
                 Label("Settings", systemImage: "slider.horizontal.3")
+            }
+            .buttonStyle(FooterButtonStyle())
+
+            Button {
+                NotificationCenter.default.post(name: .topStatsOpenNetworkTest, object: nil)
+            } label: {
+                Label("Speed Test", systemImage: "network")
             }
             .buttonStyle(FooterButtonStyle())
 
@@ -2807,6 +3058,309 @@ struct CodingAgentRow: View {
     }
 }
 
+private struct NetworkMetricCard: View {
+    let title: String
+    let icon: String
+    let accent: Color
+    let value: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(title, systemImage: icon)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundColor(Palette.text)
+                Spacer()
+                Circle()
+                    .fill(accent)
+                    .frame(width: 7, height: 7)
+            }
+            Text(value)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .foregroundColor(accent)
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+            Text(detail)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Palette.muted)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 126, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Palette.panelStrong)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Palette.border, lineWidth: 1)
+                )
+        )
+    }
+}
+
+struct NetworkSpeedTestView: View {
+    @ObservedObject var tester: NetworkSpeedTester
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            connectionCard
+            HStack(spacing: 12) {
+                NetworkMetricCard(
+                    title: "Download",
+                    icon: "arrow.down",
+                    accent: Palette.blue,
+                    value: downloadText,
+                    detail: speedDetail
+                )
+                NetworkMetricCard(
+                    title: "Upload",
+                    icon: "arrow.up",
+                    accent: Palette.red,
+                    value: uploadText,
+                    detail: speedDetail
+                )
+            }
+            qualityCard
+            actionArea
+        }
+        .padding(20)
+        .frame(width: 520, height: 520, alignment: .topLeading)
+        .background(Palette.ink)
+        .foregroundColor(Palette.text)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Network Speed")
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+            Text("Run a test only when you need an exact connection measurement.")
+                .font(.system(size: 12))
+                .foregroundColor(Palette.muted)
+        }
+    }
+
+    private var connectionCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "network")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(Palette.cyan)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Palette.cyan.opacity(0.12)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(connectionTitle)
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                Text(connectionSubtitle)
+                    .font(.system(size: 11))
+                    .foregroundColor(Palette.muted)
+            }
+            Spacer()
+            statusBadge
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Palette.panel)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
+        )
+    }
+
+    @ViewBuilder private var statusBadge: some View {
+        switch tester.phase {
+        case .idle:
+            let values = ("Ready", Palette.muted)
+            badge(values.0, color: values.1)
+        case .testing:
+            badge("Testing", color: Palette.yellow)
+        case .completed:
+            badge("Complete", color: Palette.green)
+        case .failed:
+            badge("Needs retry", color: Palette.red)
+        }
+    }
+
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundColor(color)
+            .padding(.horizontal, 9)
+            .frame(height: 23)
+            .background(Capsule().fill(color.opacity(0.12)))
+            .overlay(Capsule().stroke(color.opacity(0.24), lineWidth: 1))
+    }
+
+    private var qualityCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Connection Quality")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                Spacer()
+                if let result = tester.result {
+                    Text(qualityLabel(for: result))
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(Palette.cyan)
+                }
+            }
+
+            if let result = tester.result {
+                HStack(spacing: 22) {
+                    qualityMetric("Idle latency", value: String(format: "%.0f ms", result.idleLatencyMilliseconds))
+                    Divider().overlay(Palette.border)
+                    qualityMetric("Responsiveness", value: String(format: "%.0f RPM", result.responsivenessRPM))
+                    Divider().overlay(Palette.border)
+                    qualityMetric("Interface", value: result.interfaceName)
+                }
+                .frame(height: 43)
+            } else {
+                Text(qualityMessage)
+                    .font(.system(size: 12))
+                    .foregroundColor(qualityMessageColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, minHeight: 43, alignment: .leading)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 102, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Palette.panel)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.border, lineWidth: 1))
+        )
+    }
+
+    private func qualityMetric(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Palette.muted)
+            Text(value)
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var actionArea: some View {
+        VStack(spacing: 10) {
+            if tester.isTesting {
+                TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                    let progress = estimatedProgress(at: context.date)
+                    HStack(spacing: 14) {
+                        ZStack {
+                            Circle()
+                                .stroke(Color.white.opacity(0.10), lineWidth: 5)
+                            Circle()
+                                .trim(from: 0, to: progress)
+                                .stroke(
+                                    AngularGradient(colors: [Palette.cyan, Palette.blue, Palette.purple, Palette.cyan], center: .center),
+                                    style: StrokeStyle(lineWidth: 5, lineCap: .round)
+                                )
+                                .rotationEffect(.degrees(-90))
+                            Text("\(Int((progress * 100).rounded()))%")
+                                .font(.system(size: 11, weight: .bold, design: .rounded))
+                                .foregroundColor(Palette.text)
+                        }
+                        .frame(width: 54, height: 54)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Estimated progress")
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                            ProgressView(value: progress)
+                                .progressViewStyle(.linear)
+                                .tint(Palette.cyan)
+                            Text("Measuring download, upload, latency, and responsiveness…")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Palette.muted)
+                        }
+                        Spacer(minLength: 4)
+                        Button("Cancel") { tester.cancel() }
+                            .buttonStyle(FooterButtonStyle())
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button { tester.start() } label: {
+                        Label(tester.result == nil ? "Start Test" : "Test Again", systemImage: "speedometer")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundColor(Palette.ink)
+                            .padding(.horizontal, 22)
+                            .frame(height: 34)
+                            .background(Capsule().fill(Palette.cyan))
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.defaultAction)
+                    Spacer()
+                }
+            }
+            Text("Uses Apple's built-in network quality test. Running it transfers data and may affect metered plans.")
+                .font(.system(size: 10))
+                .foregroundColor(Palette.muted)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// `networkQuality` emits final JSON only when it finishes, so no honest
+    /// byte-level completion ratio exists. This smooth elapsed-time estimate
+    /// visibly advances and caps at 95% until the command actually completes.
+    private func estimatedProgress(at date: Date) -> Double {
+        guard let startedAt = tester.startedAt else { return 0 }
+        let elapsed = max(0, date.timeIntervalSince(startedAt))
+        return min(0.95, 1 - Foundation.exp(-elapsed / 8))
+    }
+
+    private var downloadText: String {
+        if let result = tester.result { return formatNetworkSpeed(result.downloadBitsPerSecond) }
+        if tester.isTesting { return formatNetworkSpeed(tester.liveDownloadBitsPerSecond) }
+        return "—"
+    }
+
+    private var uploadText: String {
+        if let result = tester.result { return formatNetworkSpeed(result.uploadBitsPerSecond) }
+        if tester.isTesting { return formatNetworkSpeed(tester.liveUploadBitsPerSecond) }
+        return "—"
+    }
+
+    private var speedDetail: String {
+        tester.isTesting ? "Live during test" : "Measured capacity"
+    }
+
+    private var connectionTitle: String {
+        if let result = tester.result { return "Interface \(result.interfaceName)" }
+        return tester.isTesting ? "Testing your connection" : "Current connection"
+    }
+
+    private var connectionSubtitle: String {
+        if let result = tester.result {
+            return "Last tested \(result.completedAt.formatted(date: .omitted, time: .shortened))"
+        }
+        return tester.isTesting ? "This usually takes 10–30 seconds" : "No test runs until you press Start Test"
+    }
+
+    private var qualityMessage: String {
+        switch tester.phase {
+        case .failed(let message): return message
+        case .testing: return "The test is actively transferring data. You can cancel at any time."
+        case .idle, .completed: return "Start a test to measure capacity and responsiveness—not just current traffic activity."
+        }
+    }
+
+    private var qualityMessageColor: Color {
+        if case .failed = tester.phase { return Palette.red }
+        return Palette.muted
+    }
+
+    private func qualityLabel(for result: NetworkSpeedResult) -> String {
+        let downloadMbps = result.downloadBitsPerSecond / 1_000_000
+        if downloadMbps >= 200 && result.idleLatencyMilliseconds < 50 { return "Excellent" }
+        if downloadMbps >= 100 { return "Fast" }
+        if downloadMbps >= 25 { return "Good" }
+        if downloadMbps >= 10 { return "Fair" }
+        return "Limited"
+    }
+}
+
 private struct SettingsSection<Content: View>: View {
     let icon: String
     let title: String
@@ -2862,7 +3416,6 @@ struct SettingsView: View {
                             Toggle("Memory", isOn: $settings.showRAM)
                             Toggle("GPU", isOn: $settings.showGPU)
                             Toggle("Temperature", isOn: $settings.showTemp)
-                            Toggle("Network", isOn: $settings.showNetwork)
                             Divider().overlay(Palette.border)
                             Toggle("Auto fit width", isOn: $settings.compactMenuBar)
                             Text("Auto-fits the title on laptop and notched displays. TopStats keeps labels when they fit, then uses shorter labels before compact fallback.")
@@ -2918,7 +3471,7 @@ struct SettingsView: View {
             }
             .padding(18)
         }
-        .frame(width: 340, height: 560)
+        .frame(width: 340, height: 640)
         .background(Palette.ink)
         .foregroundColor(Palette.text)
     }
@@ -2961,6 +3514,7 @@ struct FooterButtonStyle: ButtonStyle {
 
 extension Notification.Name {
     static let topStatsOpenSettings = Notification.Name("TopStatsOpenSettings")
+    static let topStatsOpenNetworkTest = Notification.Name("TopStatsOpenNetworkTest")
     static let topStatsQuit = Notification.Name("TopStatsQuit")
 }
 
@@ -2973,8 +3527,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var settingsWindow: NSWindow?
+    private var networkTestWindow: NSWindow?
     private let stats = SystemStats()
     private let settings = AppSettings()
+    private let networkSpeedTester = NetworkSpeedTester()
     private var statusItem: NSStatusItem!
     private var tempHelperProcess: Process?
     private var dashboardHost: NSHostingView<TopStatsDashboardView>?
@@ -3006,6 +3562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func observeCommands() {
         NotificationCenter.default.addObserver(self, selector: #selector(openSettings), name: .topStatsOpenSettings, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(openNetworkTest), name: .topStatsOpenNetworkTest, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(quitApp), name: .topStatsQuit, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screenParametersChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screenParametersChanged), name: NSWorkspace.didWakeNotification, object: nil)
@@ -3085,7 +3642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if settingsWindow == nil {
             let settingsView = SettingsView(settings: settings)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 340, height: 560),
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 640),
                 styleMask: [.titled, .closable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
@@ -3094,6 +3651,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.title = "TopStats Settings"
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
+            window.isReleasedWhenClosed = false
+            window.collectionBehavior = [.moveToActiveSpace]
             window.isMovableByWindowBackground = true
             window.backgroundColor = NSColor(red: 0.08, green: 0.03, blue: 0.16, alpha: 1.0)
             window.appearance = NSAppearance(named: .darkAqua)
@@ -3104,6 +3663,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func openNetworkTest() {
+        if networkTestWindow == nil {
+            let speedTestView = NetworkSpeedTestView(tester: networkSpeedTester)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+                styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentView = NSHostingView(rootView: speedTestView)
+            window.title = "TopStats Network Speed"
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isReleasedWhenClosed = false
+            window.collectionBehavior = [.moveToActiveSpace]
+            window.isMovableByWindowBackground = true
+            window.backgroundColor = NSColor(red: 0.08, green: 0.03, blue: 0.16, alpha: 1.0)
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.center()
+            networkTestWindow = window
+        }
+        networkTestWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc private func quitApp() {
         tempHelperProcess?.terminate()
         NSApplication.shared.terminate(nil)
@@ -3111,6 +3695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
+        networkSpeedTester.cancel()
         tempHelperProcess?.terminate()
     }
 
@@ -3211,26 +3796,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func menuBarTitleCandidates() -> [String] {
-        let showNetwork = settings.showNetwork
-        let full = menuBarTitle(labels: true, roundedRAM: false, includeNetwork: showNetwork, separator: "  ")
-        let fullTight = menuBarTitle(labels: true, roundedRAM: false, includeNetwork: showNetwork, separator: " ")
-        let fullRounded = menuBarTitle(labels: true, roundedRAM: true, includeNetwork: showNetwork, separator: " ")
-        let shortLabels = shortLabelMenuBarTitle(includeNetwork: showNetwork)
-        let compact = menuBarTitle(labels: false, roundedRAM: true, includeNetwork: showNetwork, separator: " ")
+        let full = menuBarTitle(labels: true, roundedRAM: false, separator: "  ")
+        let fullTight = menuBarTitle(labels: true, roundedRAM: false, separator: " ")
+        let fullRounded = menuBarTitle(labels: true, roundedRAM: true, separator: " ")
+        let shortLabels = shortLabelMenuBarTitle()
+        let compact = menuBarTitle(labels: false, roundedRAM: true, separator: " ")
 
         var candidates = [full, fullTight, fullRounded, shortLabels]
         if settings.compactMenuBar {
             candidates.append(compact)
         }
-        if showNetwork {
-            candidates.append(menuBarTitle(labels: settings.compactMenuBar == false, roundedRAM: true, includeNetwork: false, separator: " "))
-            candidates.append(shortLabelMenuBarTitle(includeNetwork: false))
-        }
         candidates.append(compact)
         return candidates
     }
 
-    private func shortLabelMenuBarTitle(includeNetwork: Bool) -> String {
+    private func shortLabelMenuBarTitle() -> String {
         var parts: [String] = []
 
         if settings.showCPU {
@@ -3250,14 +3830,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             parts.append(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))
         }
 
-        if includeNetwork {
-            parts.append("D\(formatBitsPerSecond(stats.downloadSpeed, compact: true)) U\(formatBitsPerSecond(stats.uploadSpeed, compact: true))")
-        }
-
         return parts.isEmpty ? "TopStats" : parts.joined(separator: " ")
     }
 
-    private func menuBarTitle(labels: Bool, roundedRAM: Bool, includeNetwork: Bool, separator: String) -> String {
+    private func menuBarTitle(labels: Bool, roundedRAM: Bool, separator: String) -> String {
         var parts: [String] = []
 
         if settings.showCPU {
@@ -3280,10 +3856,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if settings.showTemp {
             parts.append(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))
-        }
-
-        if includeNetwork {
-            parts.append("D\(formatBitsPerSecond(stats.downloadSpeed, compact: true)) U\(formatBitsPerSecond(stats.uploadSpeed, compact: true))")
         }
 
         return parts.isEmpty ? "TopStats" : parts.joined(separator: separator)
@@ -3423,9 +3995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             String(format: "RAM available estimate: %.1f GB", stats.ramFree),
             String(format: "GPU: %.0f%%", stats.gpuUsage),
             "GPU clients: \(stats.gpuClientCount)",
-            "Temperature: \(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))",
-            "Download: \(formatBitsPerSecond(stats.downloadSpeed, compact: false))",
-            "Upload: \(formatBitsPerSecond(stats.uploadSpeed, compact: false))"
+            "Temperature: \(formatTemperature(celsius: stats.temperatureValue, isEstimate: stats.temperatureIsEstimate, useFahrenheit: settings.useFahrenheit))"
         ].joined(separator: "\n")
     }
 
@@ -3482,8 +4052,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 // MARK: - Main
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+#if !NETWORK_TESTS
+@main
+struct TopStatsAppMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
+#endif

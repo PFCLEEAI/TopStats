@@ -7,7 +7,7 @@ echo "Building TopStats..."
 
 # Compile main app (release optimization: -Onone debug codegen is 5-20x slower
 # on the per-tick sampling/formatting paths that run every 5 s for the app's lifetime)
-swiftc -O -o TopStats TopStats.swift -framework Cocoa -framework SwiftUI -framework IOKit -framework Network
+swiftc -parse-as-library -O -o TopStats TopStats.swift -framework Cocoa -framework SwiftUI -framework IOKit
 
 # Compile temp helper (Objective-C version for accurate Apple Silicon temperature reading)
 # Uses IOHIDEventSystemClient to read actual CPU die temperature from HID sensors
@@ -61,9 +61,9 @@ cat > "TopStats.app/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.8.1</string>
+    <string>1.9.0</string>
     <key>CFBundleVersion</key>
-    <string>25</string>
+    <string>26</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run offline network tests
+        run: ./tests/run-network-tests.sh
+      - name: Build app bundle
+        run: ./build.sh
+      - name: Verify app signature
+        run: codesign --verify --deep --strict TopStats.app
